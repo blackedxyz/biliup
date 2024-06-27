@@ -2,7 +2,7 @@ import logging
 import platform
 import sys
 
-__version__ = "0.4.57"
+__version__ = "0.4.70"
 
 LOG_CONF = {
     'version': 1,
@@ -53,3 +53,9 @@ if (3, 10, 6) > sys.version_info >= (3, 8) and platform.system() == 'Windows':
 
     proactor_events._ProactorBasePipeTransport.__del__ = silence_event_loop_closed(
         proactor_events._ProactorBasePipeTransport.__del__)
+
+
+if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+    import multiprocessing
+    multiprocessing.freeze_support()
+    print('running in a PyInstaller bundle')

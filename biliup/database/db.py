@@ -30,10 +30,9 @@ def datetime_to_struct_time(date: datetime):
     return time.localtime(date.timestamp())
 
 
-def init(no_http):
+def init(no_http, first_run):
     """初始化数据库"""
-    run = not Path.cwd().joinpath("data/data.sqlite3").exists()
-    if no_http and not run:
+    if no_http and not first_run:
         new_name = f'{DB_PATH}.backup'
         if os.path.exists(new_name):
             os.remove(new_name)
@@ -41,7 +40,7 @@ def init(no_http):
         print(f"旧数据库已备份为: {new_name}")  # 在logger加载配置之前执行，只能使用print
     BaseModel.metadata.create_all(engine)  # 创建所有表
     migrate_via_alembic()
-    return run or no_http
+    return first_run or no_http
 
 
 def get_stream_info(db: Session, name: str) -> dict:
@@ -138,6 +137,21 @@ def update_file_list(db: Session, database_row_id: int, file_name: str) -> int:
     return file_list.id
 
 
+# def delete_file_list(db: Session, database_row_id: int, file_name: str) -> int:
+#     """从视频文件列表中删除指定的文件名，返回删除的行数，若不存在则返回 0"""
+#     # 查询数据库以获取对应的streamer_info
+#     streamer_info = db.get(StreamerInfo, database_row_id)
+#     if not streamer_info:
+#         return 0
+#     stmt = delete(FileList).where(
+#         (FileList.file == file_name),
+#         (FileList.streamer_info_id == streamer_info.id)
+#     )
+#     result = db.execute(stmt)
+#     db.commit()
+#     return result.rowcount
+
+
 def get_file_list(db: Session, database_row_id: int) -> List[str]:
     """获取视频文件列表"""
     file_list = db.get(StreamerInfo, database_row_id).filelist
@@ -156,7 +170,7 @@ def migrate_via_alembic():
     script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migration")
     versions_scripts_path = os.path.join(script_path, 'versions')
     if not os.path.exists(versions_scripts_path):
-        os.mkdir(versions_scripts_path, 0o700)
+        os.makedirs(versions_scripts_path, 0o700)
     alembic_cfg.set_main_option('script_location', script_path)
     command.stamp(alembic_cfg, 'head', purge=True)  # 将当前标记为最新版
     scripts = command.revision(  # 自动生成迁移脚本

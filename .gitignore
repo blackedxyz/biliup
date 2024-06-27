@@ -5,6 +5,7 @@
 *.flv
 *.mp4
 *.part
+*.webm
 backup
 venv./
 .venv/
@@ -13,6 +14,7 @@ test/
 pdm.lock
 .pdm-python
 config.*.*
+config.yaml
 !public/config.yaml
 /configlog.ini
 ds_update.log*
@@ -23,6 +25,7 @@ ds_update.log*
 dist/
 build/
 cover/
+cache/
 
 *.back
 bili.cookie.json
@@ -34,7 +37,7 @@ biliup/**/public
 !package-lock.json
 qrcode.png
 *.log
-./*.ts
+/*.ts
 /biliup/stream-gears/
 data/
 .next

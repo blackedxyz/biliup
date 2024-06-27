@@ -5,17 +5,14 @@ import asyncio
 import logging.config
 import platform
 import shutil
-import threading
-import time
 from pathlib import Path
 
 import biliup.common.reload
-from biliup.common.timer import Timer
 from biliup.config import config
-from biliup.database.db import SessionLocal, init
-from . import __version__, LOG_CONF
-from .common.Daemon import Daemon
-from .common.reload import AutoReload
+from biliup import __version__, LOG_CONF
+from biliup.common.Daemon import Daemon
+from biliup.common.reload import AutoReload
+from biliup.common.log import DebugLevelFilter
 
 
 def arg_parser():
@@ -42,28 +39,41 @@ def arg_parser():
     parser.set_defaults(func=lambda: asyncio.run(main(args)))
     args = parser.parse_args()
     biliup.common.reload.program_args = args.__dict__
-    # 初始化数据库
-    with SessionLocal() as db:
-        if init(args.no_http):
+
+    is_stop = args.func == daemon.stop
+
+    if not is_stop:
+        from biliup.database.db import SessionLocal, init
+        first_run = not Path.cwd().joinpath("data/data.sqlite3").exists()
+        with SessionLocal() as db:
             try:
                 config.load(args.config)
-                config.save_to_db(db)
+                if init(args.no_http, first_run):
+                    config.save_to_db(db)
+                    first_run = False
             except FileNotFoundError:
-                print(f'新版本不依赖配置文件,请访问 WebUI 修改配置')
-        config.load_from_db(db)
-    # db.remove()
-    LOG_CONF.update(config.get('LOGGING', {}))
-    if args.verbose:
-        LOG_CONF['loggers']['biliup']['level'] = args.verbose
-        LOG_CONF['root']['level'] = args.verbose
-    logging.config.dictConfig(LOG_CONF)
+                print(f'新版本不依赖配置文件，请访问 WebUI 修改配置')
+            if first_run:
+                init(args.no_http, first_run)
+            config.load_from_db(db)
+        # db.remove()
+        LOG_CONF.update(config.get('LOGGING', {}))
+        if args.verbose:
+            LOG_CONF['loggers']['biliup']['level'] = args.verbose
+            LOG_CONF['root']['level'] = args.verbose
+        logging.config.dictConfig(LOG_CONF)
+        logging.getLogger('httpx').addFilter(DebugLevelFilter())
+        # logging.getLogger('hpack').setLevel(logging.CRITICAL)
+        # logging.getLogger('httpx').setLevel(logging.CRITICAL)
     if platform.system() == 'Windows':
+        if is_stop:
+            return
         return asyncio.run(main(args))
     args.func()
 
 
 async def main(args):
-    from .app import event_manager
+    from biliup.app import event_manager
 
     event_manager.start()
 
@@ -83,6 +93,10 @@ async def main(args):
         detector = AutoReload(event_manager, interval=interval)
         biliup.common.reload.global_reloader = detector
         await asyncio.gather(detector.astart())
+
+
+class GracefulExit(SystemExit):
+    code = 1
 
 
 if __name__ == '__main__':

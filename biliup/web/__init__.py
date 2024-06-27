@@ -202,17 +202,17 @@ async def streamers(request):
 @routes.get('/v1/streamer-info')
 async def streamers(request):
     res = []
-    db = request['db']
-    result = db.scalars(select(StreamerInfo))
-    for s_info in result:
-        streamer_info = s_info.as_dict()
-        streamer_info['files'] = []
-        for file in s_info.filelist:
-            tmp = file.as_dict()
-            del tmp['streamer_info_id']
-            streamer_info['files'].append(tmp)
-        streamer_info['date'] = int(streamer_info['date'].timestamp())
-        res.append(streamer_info)
+    with SessionLocal() as db:
+        result = db.scalars(select(StreamerInfo))
+        for s_info in result:
+            streamer_info = s_info.as_dict()
+            streamer_info['files'] = []
+            for file in s_info.filelist:
+                tmp = file.as_dict()
+                del tmp['streamer_info_id']
+                streamer_info['files'].append(tmp)
+            streamer_info['date'] = int(streamer_info['date'].timestamp())
+            res.append(streamer_info)
     return web.json_response(res)
 
 
@@ -220,21 +220,21 @@ async def streamers(request):
 async def streamers(request):
     from biliup.app import context
     res = []
-    db = request['db']
-    result = db.scalars(select(LiveStreamers))
-    for ls in result:
-        temp = ls.as_dict()
-        url = temp['url']
-        status = 'Idle'
-        if context['PluginInfo'].url_status.get(url) == 1:
-            status = 'Working'
-        if context['url_upload_count'].get(url, 0) > 0:
-            status = 'Inspecting'
-        temp['status'] = status
-        if temp.get("upload_streamers_id"):  # 返回 upload_id 而不是 upload_streamers
-            temp["upload_id"] = temp["upload_streamers_id"]
-        temp.pop("upload_streamers_id")
-        res.append(temp)
+    with SessionLocal() as db:
+        result = db.scalars(select(LiveStreamers))
+        for ls in result:
+            temp = ls.as_dict()
+            url = temp['url']
+            status = 'Idle'
+            if context['PluginInfo'].url_status.get(url) == 1:
+                status = 'Working'
+            if context['url_upload_count'].get(url, 0) > 0:
+                status = 'Inspecting'
+            temp['status'] = status
+            if temp.get("upload_streamers_id"):  # 返回 upload_id 而不是 upload_streamers
+                temp["upload_id"] = temp["upload_streamers_id"]
+            temp.pop("upload_streamers_id")
+            res.append(temp)
     return web.json_response(res)
 
 
@@ -243,22 +243,22 @@ async def add_lives(request):
     from biliup.app import context
     json_data = await request.json()
     uid = json_data.get('upload_id')
-    db = request['db']
-    if uid:
-        us = db.get(UploadStreamers, uid)
-        to_save = LiveStreamers(**LiveStreamers.filter_parameters(json_data), upload_streamers_id=us.id)
-    else:
-        to_save = LiveStreamers(**LiveStreamers.filter_parameters(json_data))
-    try:
-        db.add(to_save)
-        db.commit()
+    with SessionLocal() as db:
+        if uid:
+            us = db.get(UploadStreamers, uid)
+            to_save = LiveStreamers(**LiveStreamers.filter_parameters(json_data), upload_streamers_id=us.id)
+        else:
+            to_save = LiveStreamers(**LiveStreamers.filter_parameters(json_data))
+        try:
+            db.add(to_save)
+            db.commit()
         # db.flush(to_save)
-    except Exception as e:
-        logger.exception("Error handling request")
-        return web.HTTPBadRequest(text=str(e))
-    config.load_from_db(db)
-    context['PluginInfo'].add(json_data['remark'], json_data['url'])
-    return web.json_response(to_save.as_dict())
+        except Exception as e:
+            logger.exception("Error handling request")
+            return web.HTTPBadRequest(text=str(e))
+        config.load_from_db(db)
+        context['PluginInfo'].add(json_data['remark'], json_data['url'])
+        return web.json_response(to_save.as_dict())
 
 
 @routes.put('/v1/streamers')
@@ -266,65 +266,68 @@ async def lives(request):
     from biliup.app import context
     json_data = await request.json()
     # old = LiveStreamers.get_by_id(json_data['id'])
-    db = request['db']
-    old = db.get(LiveStreamers, json_data['id'])
-    old_url = old.url
-    uid = json_data.get('upload_id')
-    try:
-        if uid:
-            # us = UploadStreamers.get_by_id(json_data['upload_id'])
-            us = db.get(UploadStreamers, json_data['upload_id'])
-            # LiveStreamers.update(**json_data, upload_streamers=us).where(LiveStreamers.id == old.id).execute()
-            # db.update_live_streamer(**{**json_data, "upload_streamers_id": us.id})
-            db.execute(update(LiveStreamers), [{**json_data, "upload_streamers_id": us.id}])
-            db.commit()
-        else:
-            # LiveStreamers.update(**json_data).where(LiveStreamers.id == old.id).execute()
-            db.execute(update(LiveStreamers), [json_data])
-            db.commit()
-    except Exception as e:
-        return web.HTTPBadRequest(text=str(e))
-    config.load_from_db(db)
-    context['PluginInfo'].delete(old_url)
-    context['PluginInfo'].add(json_data['remark'], json_data['url'])
-    # return web.json_response(LiveStreamers.get_dict(id=json_data['id']))
-    return web.json_response(db.get(LiveStreamers, json_data['id']).as_dict())
+    with SessionLocal() as db:
+        old = db.get(LiveStreamers, json_data['id'])
+        old_url = old.url
+        uid = json_data.get('upload_id')
+        # semi-ui 不能直接为 ArrayField 设置空默认值
+        # 当前端更新后，应移除这里的数据修改
+        new_data = {key: json_data.get(key, None) for key in old.as_dict() if key != 'upload_streamers_id'}
+        try:
+            if uid:
+                # us = UploadStreamers.get_by_id(json_data['upload_id'])
+                us = db.get(UploadStreamers, json_data['upload_id'])
+                # LiveStreamers.update(**json_data, upload_streamers=us).where(LiveStreamers.id == old.id).execute()
+                # db.update_live_streamer(**{**json_data, "upload_streamers_id": us.id})
+                db.execute(update(LiveStreamers), [{**new_data, "upload_streamers_id": us.id}])
+                db.commit()
+            else:
+                # LiveStreamers.update(**json_data).where(LiveStreamers.id == old.id).execute()
+                db.execute(update(LiveStreamers), [new_data])
+                db.commit()
+        except Exception as e:
+            return web.HTTPBadRequest(text=str(e))
+        config.load_from_db(db)
+        context['PluginInfo'].delete(old_url)
+        context['PluginInfo'].add(json_data['remark'], json_data['url'])
+        # return web.json_response(LiveStreamers.get_dict(id=json_data['id']))
+        return web.json_response(db.get(LiveStreamers, json_data['id']).as_dict())
 
 
 @routes.delete('/v1/streamers/{id}')
 async def streamers(request):
     from biliup.app import context
     # org = LiveStreamers.get_by_id(request.match_info['id'])
-    db = request['db']
-    org = db.get(LiveStreamers, request.match_info['id'])
+    with SessionLocal() as db:
+        org = db.get(LiveStreamers, request.match_info['id'])
     # LiveStreamers.delete_by_id(request.match_info['id'])
-    db.delete(org)
-    db.commit()
-    context['PluginInfo'].delete(org.url)
+        db.delete(org)
+        db.commit()
+        context['PluginInfo'].delete(org.url)
     return web.HTTPOk()
 
 
 @routes.get('/v1/upload/streamers')
 async def get_streamers(request):
-    db = request['db']
-    res = db.scalars(select(UploadStreamers))
-    return web.json_response([resp.as_dict() for resp in res])
+    with SessionLocal() as db:
+        res = db.scalars(select(UploadStreamers))
+        return web.json_response([resp.as_dict() for resp in res])
 
 
 @routes.get('/v1/upload/streamers/{id}')
 async def streamers_id(request):
     _id = request.match_info['id']
-    db = request['db']
-    res = db.get(UploadStreamers, _id).as_dict()
-    return web.json_response(res)
+    with SessionLocal() as db:
+        res = db.get(UploadStreamers, _id).as_dict()
+        return web.json_response(res)
 
 
 @routes.delete('/v1/upload/streamers/{id}')
 async def streamers(request):
-    db = request['db']
-    us = db.get(UploadStreamers, request.match_info['id'])
-    db.delete(us)
-    db.commit()
+    with SessionLocal() as db:
+        us = db.get(UploadStreamers, request.match_info['id'])
+        db.delete(us)
+        db.commit()
     # UploadStreamers.delete_by_id(request.match_info['id'])
     return web.HTTPOk()
 
@@ -332,48 +335,49 @@ async def streamers(request):
 @routes.post('/v1/upload/streamers')
 async def streamers_post(request):
     json_data = await request.json()
-    db = request['db']
-    if "id" in json_data.keys():  # 前端未区分更新和新建, 暂时从后端区分
-        db.execute(update(UploadStreamers), [json_data])
-        id = json_data["id"]
-    else:
-        to_save = UploadStreamers(**UploadStreamers.filter_parameters(json_data))
-        db.add(to_save)
+    with SessionLocal() as db:
+        if "id" in json_data.keys():  # 前端未区分更新和新建, 暂时从后端区分
+            db.execute(update(UploadStreamers), [json_data])
+            id = json_data["id"]
+        else:
+            to_save = UploadStreamers(**UploadStreamers.filter_parameters(json_data))
+            db.add(to_save)
+            db.commit()
+            id = to_save.id
         db.commit()
-        id = to_save.id
-    db.commit()
-    config.load_from_db(db)
-    # res = to_save.as_dict()
-    # return web.json_response(res)
-    return web.json_response(db.get(UploadStreamers, id).as_dict())
+        config.load_from_db(db)
+        # res = to_save.as_dict()
+        # return web.json_response(res)
+        return web.json_response(db.get(UploadStreamers, id).as_dict())
 
 
 @routes.put('/v1/upload/streamers')
 async def streamers_put(request):
     json_data = await request.json()
-    db = request['db']
+    with SessionLocal() as db:
     # UploadStreamers.update(**json_data)
-    db.execute(update(UploadStreamers), [json_data])
-    db.commit()
-    config.load_from_db(db)
-    # return web.json_response(UploadStreamers.get_dict(id=json_data['id']))
-    return web.json_response(db.get(UploadStreamers, json_data['id']).as_dict())
+        db.execute(update(UploadStreamers), [json_data])
+        db.commit()
+        config.load_from_db(db)
+        # return web.json_response(UploadStreamers.get_dict(id=json_data['id']))
+        return web.json_response(db.get(UploadStreamers, json_data['id']).as_dict())
 
 
 @routes.get('/v1/users')
 async def users(request):
     # records = Configuration.select().where(Configuration.key == 'bilibili-cookies')
-    db = request['db']
-    records = db.scalars(
-        select(Configuration).where(Configuration.key == 'bilibili-cookies'))
     res = []
-    for record in records:
-        res.append({
-            'id': record.id,
-            'name': record.value,
-            'value': record.value,
-            'platform': record.key,
-        })
+    with SessionLocal() as db:
+        records = db.scalars(
+            select(Configuration).where(Configuration.key == 'bilibili-cookies'))
+
+        for record in records:
+            res.append({
+                'id': record.id,
+                'name': record.value,
+                'value': record.value,
+                'platform': record.key,
+            })
     return web.json_response(res)
 
 
@@ -381,27 +385,27 @@ async def users(request):
 async def users(request):
     json_data = await request.json()
     to_save = Configuration(key=json_data['platform'], value=json_data['value'])
-    db = request['db']
-    db.add(to_save)
-    # to_save.save()
-    # db.flush(to_save)
-    resp = {
-        'id': to_save.id,
-        'name': to_save.value,
-        'value': to_save.value,
-        'platform': to_save.key,
-    }
-    db.commit()
-    return web.json_response([resp])
+    with SessionLocal() as db:
+        db.add(to_save)
+        # to_save.save()
+        # db.flush(to_save)
+        resp = {
+            'id': to_save.id,
+            'name': to_save.value,
+            'value': to_save.value,
+            'platform': to_save.key,
+        }
+        db.commit()
+        return web.json_response([resp])
 
 
 @routes.delete('/v1/users/{id}')
 async def users(request):
     # Configuration.delete_by_id(request.match_info['id'])
-    db = request['db']
-    configuration = db.get(Configuration, request.match_info['id'])
-    db.delete(configuration)
-    db.commit()
+    with SessionLocal() as db:
+        configuration = db.get(Configuration, request.match_info['id'])
+        db.delete(configuration)
+        db.commit()
     return web.HTTPOk()
 
 
@@ -409,41 +413,42 @@ async def users(request):
 async def users(request):
     try:
         # record = Configuration.get(Configuration.key == 'config')
-        db = request['db']
-        record = db.execute(
-            select(Configuration).where(Configuration.key == 'config')
-        ).scalar_one()
+        with SessionLocal() as db:
+            record = db.execute(
+                select(Configuration).where(Configuration.key == 'config')
+            ).scalar_one()
+            return web.json_response(json.loads(record.value))
     except NoResultFound:
         return web.json_response({})
     except MultipleResultsFound as e:
         return web.json_response({"status": 500, 'error': f"有多个空间配置同时存在: {e}"}, status=500)
-    return web.json_response(json.loads(record.value))
+
 
 
 @routes.put('/v1/configuration')
 async def users(request):
     json_data = await request.json()
-    db = request['db']
-    try:
-        # record = Configuration.get(Configuration.key == 'config')
-        record = db.execute(
-            select(Configuration).where(Configuration.key == 'config')
-        ).scalar_one()  # 判断是否只有一行空间配置
-        record.value = json.dumps(json_data)
-        # db.flush(record)
-        resp = record.as_dict()
-        # to_save = Configuration(key='config', value=json.dumps(json_data), id=record.id)
-    except NoResultFound:  # 如果数据库中没有空间配置行，新建
-        to_save = Configuration(key='config', value=json.dumps(json_data))
-        # to_save.save()
-        db.add(to_save)
+    with SessionLocal() as db:
+        try:
+            # record = Configuration.get(Configuration.key == 'config')
+            record = db.execute(
+                select(Configuration).where(Configuration.key == 'config')
+            ).scalar_one()  # 判断是否只有一行空间配置
+            record.value = json.dumps(json_data)
+            # db.flush(record)
+            resp = record.as_dict()
+            # to_save = Configuration(key='config', value=json.dumps(json_data), id=record.id)
+        except NoResultFound:  # 如果数据库中没有空间配置行，新建
+            to_save = Configuration(key='config', value=json.dumps(json_data))
+            # to_save.save()
+            db.add(to_save)
+            db.commit()
+            # db.flush(to_save)
+            resp = to_save.as_dict()
+        except MultipleResultsFound as e:  # 如果有多行，报错
+            return web.json_response({"status": 500, 'error': f"有多个空间配置同时存在: {e}"}, status=500)
         db.commit()
-        # db.flush(to_save)
-        resp = to_save.as_dict()
-    except MultipleResultsFound as e:  # 如果有多行，报错
-        return web.json_response({"status": 500, 'error': f"有多个空间配置同时存在: {e}"}, status=500)
-    db.commit()
-    config.load_from_db(db)
+        config.load_from_db(db)
     return web.json_response(resp)
 
 
@@ -460,8 +465,8 @@ async def m_upload(request):
 @routes.post('/v1/dump')
 async def dump_config(request):
     json_data = await request.json()
-    db = request['db']
-    config.load_from_db(db)
+    with SessionLocal() as db:
+        config.load_from_db(db)
     file = config.dump(json_data['path'])
     return web.json_response({'path': file})
 
@@ -486,23 +491,23 @@ async def app_status(request):
 async def pre_archive(request):
     # path = 'cookies.json'
     # conf = Configuration.get_or_none(Configuration.key == 'bilibili-cookies')
-    db = request['db']
-    confs = db.scalars(
-        select(Configuration).where(Configuration.key == 'bilibili-cookies'))
+    with SessionLocal() as db:
+        confs = db.scalars(
+            select(Configuration).where(Configuration.key == 'bilibili-cookies'))
     # if conf is not None:
     #     path = conf.value
-    for conf in confs:
-        path = conf.value
-        try:
-            config.load_cookies(path)
-            cookies = config.data['user']['cookies']
-            res = BiliBili.tid_archive(cookies)
-            if res['code'] != 0:
+        for conf in confs:
+            path = conf.value
+            try:
+                config.load_cookies(path)
+                cookies = config.data['user']['cookies']
+                res = BiliBili.tid_archive(cookies)
+                if res['code'] != 0:
+                    continue
+                return web.json_response(res)
+            except:
+                logger.exception('pre_archive')
                 continue
-            return web.json_response(res)
-        except:
-            logger.exception('pre_archive')
-            continue
     return web.json_response({"status": 500, 'error': "无可用 cookie 文件"}, status=500)
 
 
@@ -620,10 +625,7 @@ def create_error_middleware(overrides):
     @web.middleware
     async def error_middleware(request, handler):
         try:
-            """ 中间件，用来在请求结束时关闭对应线程会话 """
-            with SessionLocal() as db:
-                request['db'] = db
-                return await handler(request)
+            return await handler(request)
         except web.HTTPException as ex:
             override = overrides.get(ex.status)
             if override:

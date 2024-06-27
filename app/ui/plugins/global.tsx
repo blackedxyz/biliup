@@ -27,7 +27,7 @@ const Global: React.FC = () => {
                 <Form.Select
                     label="下载插件（downloader）"
                     field="downloader"
-                    placeholder="stream-gears"
+                    placeholder="stream-gears（默认）"
                     maxTagCount={3}
                     // initValue="stream-gears"
                     extraText={
@@ -35,8 +35,7 @@ const Global: React.FC = () => {
                             选择全局默认的下载插件, 可选:
                             <br />
                             1.
-                            streamlink（streamlink配合ffmpeg混合下载模式，适合用于下载hls_fmp4与hls_ts流，因为streamlink支持多线程拉取,
-                            使用该模式下载flv流时，将会仅使用ffmpeg。请手动安装streamlink以及ffmpeg）
+                            streamlink（streamlink 用于多线程下载 hls 流，对于 FLV 流将仅使用 ffmpeg。请手动安装ffmpeg）
                             <br />
                             2. ffmpeg（纯ffmpeg下载。请手动安装ffmpeg）
                             <br />
@@ -51,7 +50,7 @@ const Global: React.FC = () => {
                     showClear={true}
                 >
                     <Select.Option value="streamlink">
-                        streamlink（混合模式）
+                        streamlink（hls多线程下载）
                     </Select.Option>
                     <Select.Option value="ffmpeg">ffmpeg</Select.Option>
                     <Select.Option value="stream-gears">
@@ -87,6 +86,27 @@ const Global: React.FC = () => {
                     }
                     label="视频分段时长（segment_time）"
                     placeholder="01:00:00"
+                    style={{ width: "100%" }}
+                    fieldStyle={{
+                        alignSelf: "stretch",
+                        padding: 0,
+                    }}
+                />
+                <Form.Input
+                    field="filename_prefix"
+                    extraText={
+                        <div style={{ fontSize: "14px" }}>
+                            全局文件名模板。可被单个主播文件名模板覆盖。可用变量如下
+                            <br />
+                            {'\u007B'}streamer{'\u007D'}: 录播备注
+                            <span style={{ margin: "0 20px"}}></span>
+                            {'\u007B'}title{'\u007D'}: 直播标题
+                            <br />
+                            %Y-%m-%d %H_%M_%S: 开始录制时的 年-月-日 时_分_秒
+                        </div>
+                    }
+                    label="文件名模板（filename_prefix）"
+                    placeholder="{streamer}%Y-%m-%dT%H_%M_%S"
                     style={{ width: "100%" }}
                     fieldStyle={{
                         alignSelf: "stretch",
@@ -129,16 +149,11 @@ const Global: React.FC = () => {
                     label="下播延迟检测（delay)"
                     extraText={
                         <div style={{ fontSize: "14px" }}>
-                            当检测到主播下播后，延迟一定时间再次检测确认，避免特殊情况提早启动上传导致漏录。
+                            当检测到主播下播后，延迟一定时间再次检测确认，避免特殊情况提早启动上传导致分稿件。
                             <br />
                             单位：秒
                             <br />
-                            默认延迟时间为 0 秒，若没有快速上传的需求，推荐设置
-                            5 分钟（300），或按需设置。
-                            <br />
-                            若设置的延迟时间超过 60
-                            秒，则会启用分段检测机制，每隔 60
-                            秒进行一次开播状态的检测。
+                            默认延迟时间为 0 秒
                         </div>
                     }
                     placeholder="0"
@@ -222,18 +237,20 @@ const Global: React.FC = () => {
                     label="上传插件（uploader）"
                     extraText="全局默认上传插件选择。"
                     placeholder="biliup-rs"
-                    style={{ width: "100%" }}
+                    noLabel={true}
+                    style={{ width: "100%", display: 'none' }}
                     fieldStyle={{
                         alignSelf: "stretch",
                         padding: 0,
                     }}
                     showClear={true}
+                    initValue='Noop'
                 >
                     <Form.Select.Option value="bili_web">
                         bili_web
                     </Form.Select.Option>
                     <Form.Select.Option value="biliup-rs">
-                        biliup-rs（默认）
+                        biliup-rs
                     </Form.Select.Option>
                     <Form.Select.Option value="Noop">
                         Noop（即不上传，但会执行后处理）

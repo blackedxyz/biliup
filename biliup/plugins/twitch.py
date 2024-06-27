@@ -4,17 +4,17 @@ import re
 import socket
 import subprocess
 import time
-from typing import Generator, List
+from typing import AsyncGenerator, List
 from urllib.parse import urlencode
 
-import requests
 import yt_dlp
 
+from biliup.common.util import client
+from biliup.config import config
+from biliup.Danmaku import DanmakuClient
 from . import logger
 from ..engine.decorators import Plugin
 from ..engine.download import DownloadBase, BatchCheck
-from biliup.config import config
-from biliup.plugins.Danmaku import DanmakuClient
 
 VALID_URL_BASE = r'(?:https?://)?(?:(?:www|go|m)\.)?twitch\.tv/(?P<id>[0-9_a-zA-Z]+)'
 VALID_URL_VIDEOS = r'https?://(?:(?:www|go|m)\.)?twitch\.tv/(?P<id>[^/]+)/(?:videos|profile|clips)'
@@ -28,7 +28,7 @@ class TwitchVideos(DownloadBase):
         self.is_download = True
         self.twitch_download_entry = None
 
-    def check_stream(self, is_check=False):
+    async def acheck_stream(self, is_check=False):
         while True:
             auth_token = TwitchUtils.get_auth_token()
             if auth_token:
@@ -74,9 +74,9 @@ class Twitch(DownloadBase, BatchCheck):
         self.twitch_disable_ads = config.get('twitch_disable_ads', True)
         self.__proc = None
 
-    def check_stream(self, is_check=False):
+    async def acheck_stream(self, is_check=False):
         channel_name = re.match(VALID_URL_BASE, self.url).group('id').lower()
-        user = TwitchUtils.post_gql({
+        user = (await TwitchUtils.post_gql({
             "query": '''
                 query query($channel_name:String!) {
                     user(login: $channel_name){
@@ -93,14 +93,14 @@ class Twitch(DownloadBase, BatchCheck):
                                 }
                             ) {
                                 signature
-                                value             
+                                value
                             }
                         }
                     }
                 }
             ''',
             'variables': {'channel_name': channel_name}
-        }).get('data', {}).get('user')
+        })).get('data', {}).get('user')
         if not user:
             logger.warning(f"{Twitch.__name__}: {self.url}: 获取错误", exc_info=True)
             return False
@@ -112,7 +112,7 @@ class Twitch(DownloadBase, BatchCheck):
         if is_check:
             return True
 
-        if self.downloader == 'ffmpeg':
+        if self.downloader in ['ffmpeg', 'streamlink']:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.bind(('localhost', 0))
                 port = s.getsockname()[1]
@@ -159,7 +159,7 @@ class Twitch(DownloadBase, BatchCheck):
             return True
 
     @staticmethod
-    def batch_check(check_urls: List[str]) -> Generator[str, None, None]:
+    async def abatch_check(check_urls: List[str]) -> AsyncGenerator[str, None]:
         ops = []
         for url in check_urls:
             channel_name = re.match(VALID_URL_BASE, url).group('id')
@@ -176,7 +176,7 @@ class Twitch(DownloadBase, BatchCheck):
                 'variables': {'login': channel_name.lower()}
             }
             ops.append(op)
-        gql = TwitchUtils.post_gql(ops)
+        gql = await TwitchUtils.post_gql(ops)
         for index, data in enumerate(gql):
             user = data.get('data', {}).get('user')
             if not user:
@@ -220,7 +220,7 @@ class TwitchUtils:
         logger.warning("Twitch Cookie已失效请及时更换，后续操作将忽略Twitch Cookie")
 
     @staticmethod
-    def post_gql(ops):
+    async def post_gql(ops):
         headers = {
             'Content-Type': 'text/plain;charset=UTF-8',
             'Client-ID': _CLIENT_ID,
@@ -229,16 +229,33 @@ class TwitchUtils:
         if auth_token:
             headers['Authorization'] = f'OAuth {auth_token}'
 
-        gql = requests.post(
-            'https://gql.twitch.tv/gql',
-            json=ops,
-            headers=headers,
-            timeout=15)
-        gql.close()
-        data = gql.json()
+        if isinstance(ops, list):
+            limit = 30
+            ops_list = [ops[i:i + limit] for i in range(0, len(ops), limit)]
+            data = []
+            for __ops in ops_list:
+                __data = await TwitchUtils.__post_gql(headers, __ops)
+                if __data: # 让检测不抛出异常
+                    data.extend(__data)
+            return data
 
-        if isinstance(data, dict) and data.get('error') == 'Unauthorized':
-            TwitchUtils.invalid_auth_token()
-            return TwitchUtils.post_gql(ops)
+        # 正常下载由上层方法处理
+        return await TwitchUtils.__post_gql(headers, ops)
 
-        return data
+    @staticmethod
+    async def __post_gql(headers, ops):
+        try:
+            _resp = await client.post(
+                'https://gql.twitch.tv/gql',
+                json=ops,
+                headers=headers,
+                timeout=15)
+            _resp.raise_for_status()
+            gql = _resp.json()
+            if isinstance(gql, dict) and gql.get('error') == 'Unauthorized':
+                TwitchUtils.invalid_auth_token()
+                return await TwitchUtils.post_gql(ops)
+            return gql
+        except:
+            logger.exception(f"Twitch - post_gql: {ops}")
+        return {}

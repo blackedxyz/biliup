@@ -11,7 +11,7 @@ class YDownload(DownloadBase):
         super().__init__(fname, url, suffix)
         self.ydl_opts = {}
 
-    def check_stream(self, is_check=False):
+    async def acheck_stream(self, is_check=False):
         try:
             self.get_sinfo()
             return True
@@ -34,7 +34,7 @@ class YDownload(DownloadBase):
 
     def download(self):
         try:
-            filename = self.gen_download_filename(is_fmt=True)
+            filename = self.gen_download_filename(is_fmt=True) + '.' + self.suffix
             self.ydl_opts = {'outtmpl': filename}
             with yt_dlp.YoutubeDL(self.ydl_opts) as ydl:
                 ydl.download([self.url])
@@ -49,7 +49,7 @@ class SDownload(DownloadBase):
         self.stream = None
         self.flag = Event()
 
-    def check_stream(self, is_check=False):
+    async def acheck_stream(self, is_check=False):
         logger.debug(self.fname)
         import streamlink
         try:
@@ -64,7 +64,7 @@ class SDownload(DownloadBase):
             return
 
     def download(self):
-        filename = self.gen_download_filename(is_fmt=True)
+        filename = self.gen_download_filename(is_fmt=True) + '.' + self.suffix
         # fd = stream.open()
         try:
             with self.stream.open() as fd:
@@ -85,7 +85,7 @@ class Generic(DownloadBase):
         super().__init__(fname, url, suffix)
         self.handler = self
 
-    def check_stream(self, is_check=False):
+    async def acheck_stream(self, is_check=False):
         logger.debug(self.fname)
         try:
             site, url = url_to_module(self.url)
@@ -97,7 +97,7 @@ class Generic(DownloadBase):
         except:
             handlers = [YDownload(self.fname, self.url, 'mp4'), SDownload(self.fname, self.url, 'flv')]
             for handler in handlers:
-                if handler.check_stream():
+                if await handler.acheck_stream():
                     self.handler = handler
                     self.suffix = handler.suffix
                     return True
