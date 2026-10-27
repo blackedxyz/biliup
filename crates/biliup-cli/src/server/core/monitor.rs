@@ -1,0 +1,1572 @@
+use crate::server::common::download::{DownloadTask, start_download_workflow};
+use crate::server::common::recording_policy;
+use crate::server::common::upload::UploaderMessage;
+use crate::server::core::live::{batch_check_request, live_request, streamer_info};
+use crate::server::core::slots::{Slot, Slots};
+use crate::server::infrastructure::connection_pool::ConnectionPool;
+use crate::server::infrastructure::context::{Context, Stage, Worker, WorkerStatus};
+use crate::server::workbench;
+use async_channel::Sender;
+use biliup::downloader::live::{LivePlugin, LiveStatus};
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
+use tokio::sync::{Notify, oneshot};
+use tokio::task::JoinHandle;
+use tracing::{debug, error, info, trace, warn};
+
+/// 批量检测平台的开播缓存：一次批量请求的结果在一个检测周期内复用，
+/// 供逐间循环快速判定某房间是否开播，避免对未开播房间做逐间请求。
+#[derive(Debug)]
+struct BatchLiveCache {
+    live_urls: HashSet<String>,
+    refreshed_at: Instant,
+}
+
+/// 批量检测对单个房间的判定结果。
+enum BatchVerdict {
+    /// 批量结果显示开播，继续逐间完整检测以获取流信息
+    Live,
+    /// 批量结果显示未开播，直接放回队列
+    Offline,
+    /// 平台不支持批量检测或本轮批量请求失败，回退逐间检测
+    Fallback,
+}
+
+/// 无网络开销的跳过路径（批量结果判定未开播、不在录制时间范围内）使用的快速轮换间隔：
+/// 这些判定不发请求，短暂停即可在一个检测周期内扫完整个队列，
+/// 也让窗口一开就能立刻开录（网络频率仍由批量缓存 TTL 限制）。
+const QUICK_ROTATE_SLEEP: Duration = Duration::from_secs(1);
+
+#[derive(Debug)]
+struct MonitorTask {
+    handle: JoinHandle<()>,
+    wake: Arc<Notify>,
+    available: Arc<Notify>,
+}
+
+/// 房间处理器
+/// 管理多个直播间的状态和操作
+#[derive(Debug)]
+pub struct Monitor {
+    /// 消息发送器
+    sender: tokio::sync::mpsc::Sender<ActorMessage>,
+    /// Actor任务句柄
+    pool: ConnectionPool,
+    /// 上传消息发送器，下载任务产生分段后会通过它交给上传流程。
+    uploader: Sender<UploaderMessage>,
+    /// 下载池槽位。监控循环必须先拿到槽位，才允许检测开播并启动录制。
+    /// 这样 “开播了/成功开始录制” 只会出现在真正拥有下载并发槽位时。
+    /// 槽位由下载任务持有到录制结束，pool1_size 的唯一限流语义在这里表达；
+    /// 容量随配置保存即时调整（`DownloadManager::resize_pools`）。
+    download_slots: Arc<Slots>,
+    monitors: RwLock<HashMap<String, MonitorTask>>,
+    /// 各批量检测平台的开播缓存（platform_name -> 最近一次批量结果）。
+    batch_live: RwLock<HashMap<String, BatchLiveCache>>,
+    #[cfg(test)]
+    probe_gate: RwLock<Option<Arc<tokio::sync::Semaphore>>>,
+}
+
+impl Drop for Monitor {
+    /// 监控器销毁时的清理逻辑
+    fn drop(&mut self) {
+        for monitor in self.monitors.get_mut().unwrap().values() {
+            monitor.handle.abort();
+        }
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            let msg = ActorMessage::Shutdown;
+            let _ = sender.send(msg).await;
+            info!("RoomsHandle killed")
+        });
+        // 终止监控任务
+        // self.kill.abort();
+        // self.rooms_handle.kill.abort();
+    }
+}
+
+impl Monitor {
+    /// 创建新的房间处理器实例
+    ///
+    /// # 参数
+    /// * `name` - 平台名称
+    pub fn new(
+        uploader: Sender<UploaderMessage>,
+        download_slots: Arc<Slots>,
+        pool: ConnectionPool,
+    ) -> Self {
+        // 创建消息通道
+        let (sender, receiver) = tokio::sync::mpsc::channel(1);
+        let mut actor = RoomsActor::new(receiver);
+        // 启动Actor任务
+        let _kill = tokio::spawn(async move { actor.run().await });
+
+        Self {
+            sender,
+            pool,
+            uploader,
+            download_slots,
+            monitors: Default::default(),
+            batch_live: Default::default(),
+            #[cfg(test)]
+            probe_gate: Default::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_probe_gate(&self, gate: Arc<tokio::sync::Semaphore>) {
+        *self.probe_gate.write().unwrap() = Some(gate);
+    }
+
+    /// 检测下一个房间，返回本轮之后应等待的间隔；空队列由后台任务等待显式唤醒。
+    ///
+    async fn check_next_room(
+        self: &Arc<Self>,
+        platform_name: &str,
+        plugin: Arc<dyn LivePlugin + Send + Sync>,
+    ) -> Option<Duration> {
+        #[cfg(test)]
+        {
+            let gate = self.probe_gate.read().unwrap().clone();
+            if let Some(gate) = gate {
+                // 状态断言完成前阻止测试中的后台检测取得房间；Actor 消息仍照常处理。
+                let Ok(permit) = gate.acquire().await else {
+                    return None;
+                };
+                permit.forget();
+            }
+        }
+        let room = self.next(platform_name).await?;
+        let mut monitor_changes = room.monitor_changes();
+        // `next` 已经标为 Pending；暂停/删除可能发生在 Actor 回复与本任务恢复之间。
+        if !matches!(
+            *room.downloader_status.read().unwrap(),
+            WorkerStatus::Pending
+        ) {
+            return Some(Duration::ZERO);
+        }
+        let url = room.get_streamer().url.clone();
+        let interval = room.get_config().event_loop_interval;
+        // 探测前的录制策略：不满足就直接放回队列，既不占用下载槽位也不发任何请求。
+        // 这类条件只看配置和时钟、判定无开销，所以用快速轮换而不是整个检测周期，
+        // 条件一满足即可开录。
+        if let Some(rejection) = recording_policy::reject_before_probe(room.get_streamer()) {
+            self.wake_worker(&room).await;
+            debug!(url = url, reason = %rejection, "跳过检测");
+            return Some(QUICK_ROTATE_SLEEP);
+        }
+        // 批量检测平台：先用一个检测周期内共享的批量结果快速判定是否开播。
+        // 未开播直接跳过（不占用下载槽位、不做逐间请求），并以较短间隔轮换到
+        // 下一个房间，使整条队列在一个检测周期内扫完；批量请求本身由缓存 TTL 限流。
+        if plugin.supports_batch_check() {
+            let verdict = tokio::select! {
+                biased;
+                _ = monitor_changes.changed() => return Some(Duration::ZERO),
+                verdict = self.batch_verdict(platform_name, &plugin, &room, interval) => verdict,
+            };
+            match verdict {
+                BatchVerdict::Offline => {
+                    self.wake_worker(&room).await;
+                    debug!(url = url, "批量检测未开播");
+                    return Some(QUICK_ROTATE_SLEEP);
+                }
+                // Live / Fallback 都继续走下面的逐间完整检测
+                BatchVerdict::Live | BatchVerdict::Fallback => {}
+            }
+        }
+        let Some(download_slot) = self.try_acquire_download_slot(&room).await else {
+            self.wake_worker(&room).await;
+            return Some(Duration::from_secs(interval));
+        };
+        let request = live_request(&room);
+        // 检查直播状态
+        // 没有开始录制的分支都要先归还槽位，不能带着它睡过检测间隔：各平台的监控循环
+        // 共用下载池，只剩一个空闲槽位时会被一个平台的循环一直占着，其他平台的房间
+        // 始终拿不到槽位去检测。
+        let result = tokio::select! {
+            biased;
+            _ = monitor_changes.changed() => return Some(Duration::ZERO),
+            result = plugin.check_stream(request) => result,
+        };
+        match result {
+            Ok(LiveStatus::Live { stream }) => {
+                // 检测期间被暂停了（界面上点了暂停、Fleet 节点启动时恢复暂停状态）：不开录。
+                // 暂停时已经移出队列，这里也不放回，等恢复时再入队
+                if monitor_changes.has_changed().unwrap_or(true)
+                    || !matches!(
+                        *room.downloader_status.read().unwrap(),
+                        WorkerStatus::Pending
+                    )
+                {
+                    drop(download_slot);
+                    info!(url = url, "检测期间已暂停或更新，不开录");
+                    return Some(Duration::ZERO);
+                }
+                // 一主一备：主机在等备机上报 / 备机正在录这一场，模式 2 备机在主机在线时只监控不录
+                if let Some(hold) = crate::server::fleet::ha::hold_recording(&url) {
+                    drop(download_slot);
+                    self.wake_worker(&room).await;
+                    info!(url = url, reason = hold.reason, "开播但不录制（HA）");
+                    let wait = if hold.quick {
+                        QUICK_ROTATE_SLEEP
+                    } else {
+                        Duration::from_secs(interval)
+                    };
+                    return Some(wait);
+                }
+                // 依赖房间标题的策略要拿到流信息才能判定。命中就按「本轮不录」处理：
+                // 不建场次记录、不启动下载，等下个检测周期再看。
+                if let Some(rejection) =
+                    recording_policy::reject_before_record(room.get_streamer(), &stream.title)
+                {
+                    drop(download_slot);
+                    room.set_rejection(Some(rejection.clone()));
+                    self.wake_worker(&room).await;
+                    info!(url = url, title = stream.title, reason = %rejection, "开播但不录制");
+                    return Some(Duration::from_secs(interval));
+                }
+                room.set_rejection(None);
+                let mut info = streamer_info(&stream);
+                info.name = room.live_streamer.remark.clone();
+                let session = match workbench::store::open_session(
+                    &self.pool,
+                    room.live_streamer.id,
+                    &info,
+                    workbench::recorder::now_ms(),
+                    // A new recorder owns a new source; continuity is confirmed in the workbench.
+                    0,
+                )
+                .await
+                {
+                    Ok(session) => session,
+                    Err(e) => {
+                        drop(download_slot);
+                        error!(e=?e, "插入数据库失败");
+                        self.wake_worker(&room).await;
+                        // 失败多半是持续性的（磁盘满、直播间行已删）：不等检测间隔就
+                        // 立刻重新检测，只有这一个房间时会零间隔地反复请求平台接口
+                        return Some(Duration::from_secs(interval));
+                    }
+                };
+                if monitor_changes.has_changed().unwrap_or(true)
+                    || !matches!(
+                        *room.downloader_status.read().unwrap(),
+                        WorkerStatus::Pending
+                    )
+                {
+                    drop(download_slot);
+                    if !session.resumed
+                        && let Err(e) = workbench::store::close_session(
+                            &self.pool,
+                            session.id,
+                            workbench::recorder::now_ms(),
+                        )
+                        .await
+                    {
+                        error!(e = ?e, "关闭取消检测的场次失败");
+                    }
+                    return Some(Duration::ZERO);
+                }
+                if session.resumed {
+                    info!(
+                        url = url,
+                        session = session.id,
+                        "room: is live -> 开播了（下播后很快又开播，接着记在上一场）"
+                    );
+                } else {
+                    info!(url = url, "room: is live -> 开播了");
+                }
+
+                let context = Context::new(session.id, room.clone(), self.pool.clone(), *stream);
+                let downloader = plugin.clone();
+                let uploader = self.uploader.clone();
+                let rooms_handle = Arc::clone(self);
+
+                // 只能在已经拿到下载池槽位后启动录制。槽位移动到任务内并持有到流程结束，
+                // 因此 pool1_size 只在这里表达，不再通过下载 Actor 池或消息队列重复限流。
+                tokio::spawn(async move {
+                    let _download_slot = download_slot;
+                    start_download_workflow(
+                        downloader,
+                        context,
+                        uploader,
+                        rooms_handle,
+                        monitor_changes,
+                        session.resumed,
+                    )
+                    .await;
+                });
+
+                info!("成功开始录制 {}", url);
+            }
+            Ok(LiveStatus::Offline) => {
+                drop(download_slot);
+                // 探测结果推翻了上一轮的策略判定，清掉以免界面停在旧原因上
+                room.set_rejection(None);
+                self.wake_worker(&room).await;
+                debug!(url = room.get_streamer().url, "未开播")
+            }
+            Err(e) => {
+                drop(download_slot);
+                room.set_rejection(None);
+                self.wake_worker(&room).await;
+                error!(e=?e, ctx=room.get_streamer().url,"检查直播间出错")
+            }
+        };
+        Some(Duration::from_secs(interval))
+    }
+
+    async fn try_acquire_download_slot(&self, room: &Arc<Worker>) -> Option<Slot> {
+        let slot = self.download_slots.try_acquire();
+        if slot.is_none() {
+            debug!(
+                url = room.get_streamer().url,
+                "download pool is full, skip live check"
+            );
+        }
+        slot
+    }
+
+    /// 用批量检测结果判定单个房间是否开播。
+    /// 缓存超过一个检测周期即刷新：以当前房间的客户端/配置为该平台所有房间发起一次批量请求。
+    async fn batch_verdict(
+        self: &Arc<Self>,
+        platform_name: &str,
+        plugin: &Arc<dyn LivePlugin + Send + Sync>,
+        room: &Arc<Worker>,
+        interval: u64,
+    ) -> BatchVerdict {
+        let url = room.get_streamer().url.clone();
+
+        // 命中未过期缓存直接判定
+        if let Some(cache) = self.batch_live.read().unwrap().get(platform_name)
+            && cache.refreshed_at.elapsed() < Duration::from_secs(interval)
+        {
+            return if cache.live_urls.contains(&url) {
+                BatchVerdict::Live
+            } else {
+                BatchVerdict::Offline
+            };
+        }
+
+        // 缓存过期或缺失：为该平台所有房间发起一次批量检测
+        let urls = self.platform_urls(platform_name).await;
+        if urls.is_empty() {
+            return BatchVerdict::Fallback;
+        }
+        let request = batch_check_request(room, urls);
+        match plugin.batch_check(request).await {
+            Ok(live_urls) => {
+                let live_urls: HashSet<String> = live_urls.into_iter().collect();
+                let is_live = live_urls.contains(&url);
+                self.batch_live.write().unwrap().insert(
+                    platform_name.to_string(),
+                    BatchLiveCache {
+                        live_urls,
+                        refreshed_at: Instant::now(),
+                    },
+                );
+                if is_live {
+                    BatchVerdict::Live
+                } else {
+                    BatchVerdict::Offline
+                }
+            }
+            Err(e) => {
+                // 批量请求失败时回退逐间检测，避免整平台漏检
+                warn!(platform = platform_name, e = ?e, "批量检测失败，回退逐间检测");
+                BatchVerdict::Fallback
+            }
+        }
+    }
+
+    /// 按房间 URL 找到对应的平台插件。
+    pub async fn plugin_for(
+        self: &Arc<Self>,
+        url: &str,
+    ) -> Option<Arc<dyn LivePlugin + Send + Sync>> {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::PluginFor {
+            respond_to: send,
+            url: url.to_owned(),
+        };
+        let _ = self.sender.send(msg).await;
+        recv.await.ok().flatten()
+    }
+
+    /// 获取某平台当前队列中所有房间的 URL（用于批量检测）。
+    async fn platform_urls(self: &Arc<Self>, platform_name: &str) -> Vec<String> {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::PlatformUrls {
+            respond_to: send,
+            platform_name: platform_name.to_owned(),
+        };
+        let _ = self.sender.send(msg).await;
+        recv.await.unwrap_or_default()
+    }
+
+    /// 添加工作器到房间列表
+    ///
+    /// # 参数
+    /// * `worker` - 要添加的工作器
+    pub async fn add(
+        self: &Arc<Self>,
+        worker: Arc<Worker>,
+    ) -> Option<Arc<dyn LivePlugin + Send + Sync>> {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::Add(send, worker.clone());
+        let _ = self.sender.send(msg).await;
+        let plugin = recv.await.expect("Actor task has been killed")?;
+
+        self.rooms_handle_pool(plugin.clone(), true);
+        Some(plugin)
+    }
+
+    /// 添加工作器到房间列表
+    ///
+    /// # 参数
+    /// * `worker` - 要添加的工作器
+    pub async fn add_plugin(&self, plugin: Arc<dyn LivePlugin + Send + Sync>) {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::AddPlugin(send, plugin);
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
+
+    /// 删除指定ID的工作器
+    ///
+    /// # 参数
+    /// * `id` - 要删除的工作器ID
+    ///
+    /// # 返回
+    /// 返回剩余工作器数量
+    pub async fn del(&self, id: i64) {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::Del {
+            respond_to: send,
+            id,
+        };
+
+        // 忽略发送错误。如果发送失败，下面的recv.await也会失败
+        // 没有必要检查两次失败
+        let _ = self.sender.send(msg).await;
+        if let Some(worker) = recv.await.expect("Actor task has been killed") {
+            worker
+                .change_status(Stage::Download, WorkerStatus::Idle)
+                .await;
+        }
+    }
+
+    /// 删除指定ID的工作器
+    ///
+    /// # 参数
+    /// * `id` - 要删除的工作器ID
+    ///
+    /// # 返回
+    /// 返回剩余工作器数量
+    pub async fn get_worker(&self, id: i64) -> Option<Arc<Worker>> {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::GetWorker {
+            respond_to: send,
+            id,
+        };
+
+        // 忽略发送错误。如果发送失败，下面的recv.await也会失败
+        // 没有必要检查两次失败
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
+
+    /// 删除指定ID的工作器
+    ///
+    /// # 参数
+    /// * `id` - 要删除的工作器ID
+    ///
+    /// # 返回
+    /// 返回剩余工作器数量
+    pub async fn get_all(&self) -> Vec<Arc<Worker>> {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::GetAll { respond_to: send };
+
+        // 忽略发送错误。如果发送失败，下面的recv.await也会失败
+        // 没有必要检查两次失败
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
+
+    /// 获取下一个要处理的工作器
+    ///
+    /// # 返回
+    /// 返回下一个工作器，如果没有则返回None
+    async fn next(self: &Arc<Self>, platform_name: &str) -> Option<Arc<Worker>> {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::NextRoom {
+            respond_to: send,
+            platform_name: platform_name.to_owned(),
+        };
+
+        // 忽略发送错误。如果发送失败，下面的recv.await也会失败
+        // 没有必要检查两次失败
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
+
+    /// 放回工作队列
+    ///
+    /// # 参数
+    /// * `worker` - 要切换的工作器
+    pub async fn wake_waker(
+        self: &Arc<Self>,
+        id: i64,
+    ) -> Option<Arc<dyn LivePlugin + Send + Sync>> {
+        self.requeue(id, None, None, false).await
+    }
+
+    /// 旧工作器的检测结束时，只放回同一个实例，不能唤醒同 ID 的新配置。
+    pub(crate) async fn wake_worker(
+        self: &Arc<Self>,
+        worker: &Arc<Worker>,
+    ) -> Option<Arc<dyn LivePlugin + Send + Sync>> {
+        self.requeue(worker.id(), Some(worker.clone()), None, false)
+            .await
+    }
+
+    /// 录制收尾只能放回它自己的任务，不能覆盖同一工作器恢复后启动的新检测或录制。
+    pub(crate) async fn wake_download(
+        self: &Arc<Self>,
+        worker: &Arc<Worker>,
+        task: &Arc<DownloadTask>,
+    ) -> Option<Arc<dyn LivePlugin + Send + Sync>> {
+        self.requeue(worker.id(), Some(worker.clone()), Some(task.clone()), false)
+            .await
+    }
+
+    pub async fn resume_room(self: &Arc<Self>, id: i64) {
+        self.requeue(id, None, None, true).await;
+    }
+
+    async fn requeue(
+        self: &Arc<Self>,
+        id: i64,
+        expected: Option<Arc<Worker>>,
+        expected_download: Option<Arc<DownloadTask>>,
+        immediate: bool,
+    ) -> Option<Arc<dyn LivePlugin + Send + Sync>> {
+        let (send, recv) = oneshot::channel();
+        let msg = ActorMessage::WakeWaker {
+            respond_to: send,
+            id,
+            expected,
+            expected_download,
+            immediate,
+        };
+
+        // 忽略发送错误
+        let _ = self.sender.send(msg).await;
+        let plugin = recv.await.expect("Actor task has been killed")?;
+        self.rooms_handle_pool(plugin.clone(), immediate);
+        Some(plugin)
+    }
+
+    /// 移出工作队列
+    ///
+    /// # 参数
+    /// * `worker` - 要切换的工作器
+    pub async fn make_waker(&self, id: i64) {
+        let (send, recv) = oneshot::channel();
+
+        let msg = ActorMessage::MakeWaker(send, id);
+
+        // 忽略发送错误
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
+
+    fn spawn_monitor_task(
+        this: &Arc<Self>,
+        plugin: Arc<dyn LivePlugin + Send + Sync>,
+        platform_name: String,
+        wake: Arc<Notify>,
+        available: Arc<Notify>,
+    ) -> JoinHandle<()> {
+        let weak = Arc::downgrade(this);
+        tokio::spawn(async move {
+            info!("start -> [{platform_name}]");
+            loop {
+                // 先登记唤醒，再问 Actor 要房间；空队列回复与新增/恢复之间也不会丢通知。
+                let notified = wake.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let room_available = available.notified();
+                tokio::pin!(room_available);
+                room_available.as_mut().enable();
+                let Some(this) = weak.upgrade() else {
+                    break;
+                };
+                let interval = this.check_next_room(&platform_name, plugin.clone()).await;
+                // 等待时不持有 Monitor 的强引用，管理器退出即可取消所有监控任务。
+                drop(this);
+                match interval {
+                    Some(interval) => {
+                        tokio::select! {
+                            _ = notified => {},
+                            _ = tokio::time::sleep(interval) => {},
+                        }
+                    }
+                    None => room_available.await,
+                }
+            }
+            info!("exit -> [{platform_name}]");
+        })
+    }
+
+    fn rooms_handle_pool(
+        self: &Arc<Self>,
+        plugin: Arc<dyn LivePlugin + Send + Sync>,
+        immediate: bool,
+    ) {
+        let platform_name = plugin.name().to_owned();
+        match self.monitors.write().unwrap().entry(platform_name.clone()) {
+            Entry::Occupied(mut entry) => {
+                if entry.get().handle.is_finished() {
+                    let handle = Self::spawn_monitor_task(
+                        self,
+                        plugin.clone(),
+                        platform_name.clone(),
+                        entry.get().wake.clone(),
+                        entry.get().available.clone(),
+                    );
+                    entry.get_mut().handle = handle;
+                } else {
+                    // 自动放回只唤醒空队列；显式启动还会打断本轮检测后的休眠。
+                    entry.get().available.notify_one();
+                    if immediate {
+                        entry.get().wake.notify_one();
+                    }
+                }
+            }
+            Entry::Vacant(entry) => {
+                let wake = Arc::new(Notify::new());
+                let available = Arc::new(Notify::new());
+                let handle = Self::spawn_monitor_task(
+                    self,
+                    plugin.clone(),
+                    platform_name.clone(),
+                    wake.clone(),
+                    available.clone(),
+                );
+                entry.insert(MonitorTask {
+                    handle,
+                    wake,
+                    available,
+                });
+            }
+        }
+    }
+}
+
+/// Actor消息枚举
+/// 定义RoomsActor可以处理的消息类型
+enum ActorMessage {
+    /// 获取下一个房间
+    NextRoom {
+        respond_to: oneshot::Sender<Option<Arc<Worker>>>,
+        platform_name: String,
+    },
+    /// 获取某平台所有房间的 URL（用于批量检测）
+    PlatformUrls {
+        respond_to: oneshot::Sender<Vec<String>>,
+        platform_name: String,
+    },
+    /// 按房间 URL 找到对应平台插件（预览直连模式向平台要一条新直链时用）
+    PluginFor {
+        respond_to: oneshot::Sender<Option<Arc<dyn LivePlugin + Send + Sync>>>,
+        url: String,
+    },
+    /// 添加工作器
+    Add(
+        oneshot::Sender<Option<Arc<dyn LivePlugin + Send + Sync>>>,
+        Arc<Worker>,
+    ),
+    /// 添加工作器
+    AddPlugin(oneshot::Sender<()>, Arc<dyn LivePlugin + Send + Sync>),
+    /// 删除工作器
+    Del {
+        respond_to: oneshot::Sender<Option<Arc<Worker>>>,
+        id: i64,
+    },
+    /// 查找
+    GetWorker {
+        respond_to: oneshot::Sender<Option<Arc<Worker>>>,
+        id: i64,
+    },
+    /// 查找所有
+    GetAll {
+        respond_to: oneshot::Sender<Vec<Arc<Worker>>>,
+    },
+    /// 放回工作队列
+    WakeWaker {
+        respond_to: oneshot::Sender<Option<Arc<dyn LivePlugin + Send + Sync>>>,
+        id: i64,
+        expected: Option<Arc<Worker>>,
+        expected_download: Option<Arc<DownloadTask>>,
+        immediate: bool,
+    },
+    /// 移出工作队列
+    MakeWaker(oneshot::Sender<()>, i64),
+    Shutdown,
+}
+
+/// 房间Actor
+/// 管理房间列表的内部Actor
+/// 平台名称
+//     name: String,
+struct RoomsActor {
+    /// 消息接收器
+    receiver: tokio::sync::mpsc::Receiver<ActorMessage>,
+    /// 活跃房间列表
+    platforms: HashMap<String, VecDeque<Arc<Worker>>>,
+    /// 当前索引
+    /// 等待房间列表
+    all_workers: Vec<Arc<Worker>>,
+    // index: usize,
+    // rooms: Vec<Arc<Worker>>,
+    // waiting: Vec<Arc<Worker>>,
+    /// 下载插件
+    plugins: Vec<Arc<dyn LivePlugin + Send + Sync>>,
+}
+
+impl RoomsActor {
+    /// 创建新的房间Actor实例
+    fn new(receiver: tokio::sync::mpsc::Receiver<ActorMessage>) -> Self {
+        Self {
+            receiver,
+            // index: 0,
+            platforms: Default::default(),
+            all_workers: Default::default(),
+            plugins: Vec::new(),
+        }
+    }
+
+    /// 运行Actor主循环
+    /// 处理接收到的消息
+    async fn run(&mut self) {
+        while let Some(msg) = self.receiver.recv().await {
+            match msg {
+                ActorMessage::NextRoom {
+                    respond_to,
+                    platform_name,
+                } => {
+                    // `let _ =` 忽略发送时的任何错误
+                    // 如果使用`select!`宏取消等待响应，可能会发生这种情况
+                    let _ = respond_to.send(self.next(&platform_name));
+                }
+                ActorMessage::PluginFor { respond_to, url } => {
+                    let _ = respond_to.send(self.matches(&url));
+                }
+                ActorMessage::PlatformUrls {
+                    respond_to,
+                    platform_name,
+                } => {
+                    // `let _ =` 忽略发送时的任何错误
+                    let _ = respond_to.send(self.platform_urls(&platform_name));
+                }
+                ActorMessage::Add(respond_to, worker) => {
+                    let plugin = self.add(worker);
+                    let _ = respond_to.send(plugin);
+                }
+                ActorMessage::Del { respond_to, id } => {
+                    // `let _ =` 忽略发送时的任何错误
+                    // 如果使用`select!`宏取消等待响应，可能会发生这种情况
+
+                    let _ = respond_to.send(self.del(id).await);
+                }
+                ActorMessage::WakeWaker {
+                    respond_to,
+                    id,
+                    expected,
+                    expected_download,
+                    immediate,
+                } => {
+                    // `let _ =` 忽略发送时的任何错误
+                    let _ = respond_to.send(self.push_back(
+                        id,
+                        expected.as_ref(),
+                        expected_download.as_ref(),
+                        immediate,
+                    ));
+                }
+                ActorMessage::Shutdown => {
+                    return;
+                }
+                ActorMessage::GetWorker { respond_to, id } => {
+                    let option = self.get_worker(id);
+                    // `let _ =` 忽略发送时的任何错误
+                    let _ = respond_to.send(option);
+                }
+                ActorMessage::GetAll { respond_to } => {
+                    // `let _ =` 忽略发送时的任何错误
+                    let _ = respond_to.send(self.get_all());
+                }
+                ActorMessage::MakeWaker(respond_to, id) => {
+                    self.pop(id);
+                    // `let _ =` 忽略发送时的任何错误
+                    let _ = respond_to.send(());
+                }
+                ActorMessage::AddPlugin(respond_to, plugin) => {
+                    self.add_plugin(plugin);
+                    // `let _ =` 忽略发送时的任何错误
+                    let _ = respond_to.send(());
+                }
+            }
+        }
+        info!("Rooms actor terminated");
+    }
+
+    fn add(&mut self, worker: Arc<Worker>) -> Option<Arc<dyn LivePlugin + Send + Sync>> {
+        let plugin = self.matches(&worker.live_streamer.url)?;
+        let platform_name = plugin.name().to_owned();
+        self.all_workers.push(worker.clone());
+        let queue = self.platforms.entry(platform_name).or_default();
+        if !matches!(
+            *worker.downloader_status.read().unwrap(),
+            WorkerStatus::Pause
+        ) {
+            queue.push_back(worker.clone());
+        }
+        debug!("Added room [{}]", worker.live_streamer.url);
+        Some(plugin)
+    }
+
+    fn add_plugin(&mut self, plugin: Arc<dyn LivePlugin + Send + Sync>) {
+        self.plugins.push(plugin);
+        debug!("Added plugin size[{}]", self.plugins.len());
+    }
+
+    fn get_worker(&mut self, id: i64) -> Option<Arc<Worker>> {
+        self.all_workers
+            .iter()
+            .find(|worker| worker.id() == id)
+            .cloned()
+    }
+
+    fn get_all(&mut self) -> Vec<Arc<Worker>> {
+        reuse_vec_arc(&mut self.all_workers.iter())
+    }
+
+    /// 获取下一个工作器（循环遍历）
+    fn next(&mut self, platform_name: &str) -> Option<Arc<Worker>> {
+        let queue = self.platforms.get_mut(platform_name)?;
+        while let Some(worker) = queue.pop_front() {
+            let mut status = worker.downloader_status.write().unwrap();
+            if matches!(*status, WorkerStatus::Pause | WorkerStatus::Working(_)) {
+                continue;
+            }
+            *status = WorkerStatus::Pending;
+            drop(status);
+            return Some(worker);
+        }
+        None
+    }
+
+    /// 获取某平台所有房间的 URL（含正在检测、已弹出队列的房间）。
+    /// 以 all_workers 为源按插件归属过滤，保证覆盖整平台而非仅队列内房间。
+    fn platform_urls(&self, platform_name: &str) -> Vec<String> {
+        self.all_workers
+            .iter()
+            .filter(|worker| {
+                self.matches(&worker.live_streamer.url)
+                    .is_some_and(|plugin| plugin.name() == platform_name)
+            })
+            .map(|worker| worker.live_streamer.url.clone())
+            .collect()
+    }
+
+    /// 放回工作队列
+    fn push_back(
+        &mut self,
+        id: i64,
+        expected: Option<&Arc<Worker>>,
+        expected_download: Option<&Arc<DownloadTask>>,
+        immediate: bool,
+    ) -> Option<Arc<dyn LivePlugin + Send + Sync>> {
+        // 在总数组中找不到，说明该房间已被移除我们也不放回
+        let worker = self.get_worker(id)?;
+        if expected.is_some_and(|expected| !Arc::ptr_eq(expected, &worker)) {
+            return None;
+        }
+        if let WorkerStatus::Pause = *worker.downloader_status.write().unwrap() {
+            // 暂停状态则不放回
+            warn!("Paused room [{}]", worker.live_streamer.url);
+            return None;
+        }
+        for (name, queue) in self.platforms.iter_mut() {
+            if queue.iter().any(|w| w.id() == id) {
+                // 说明找到了已经入队的房间，则是更新的情况
+                warn!(name = name, "房间已更新无需入队");
+                return None;
+            }
+        }
+
+        let plugin = self.matches(&worker.live_streamer.url)?;
+        let queue = self.platforms.get_mut(plugin.name())?;
+        let mut status = worker.downloader_status.write().unwrap();
+        if matches!(*status, WorkerStatus::Pause) {
+            return None;
+        }
+        if let Some(expected_download) = expected_download
+            && !matches!(
+                &*status,
+                WorkerStatus::Working(task) if Arc::ptr_eq(task, expected_download)
+            )
+        {
+            return None;
+        }
+        *status = WorkerStatus::Idle;
+        drop(status);
+        if immediate {
+            queue.push_front(worker);
+        } else {
+            queue.push_back(worker);
+        }
+        Some(plugin)
+    }
+
+    /// 移出工作队列
+    fn pop(&mut self, id: i64) {
+        for (_name, queue) in self.platforms.iter_mut() {
+            if let Some(pos) = queue.iter().position(|w| w.id() == id) {
+                queue.remove(pos); // 只删掉这个队列中第一个匹配的 worker
+                return;
+            }
+        }
+        warn!("移出工作队列 failed: No room found with id {}", id);
+    }
+
+    /// 删除指定ID的工作器
+    async fn del(&mut self, id: i64) -> Option<Arc<Worker>> {
+        let worker = self.get_worker(id)?;
+        let plugin = self.matches(&worker.live_streamer.url)?;
+        let platform_name = plugin.name();
+        // 从 platforms 中删除
+        if let Some(workers) = self.platforms.get_mut(platform_name) {
+            workers.retain(|w| w.id() != id);
+        } else {
+            error!("Removed room [{:?}] {}", platform_name, id);
+        }
+
+        // 从 all_workers 中删除
+        self.all_workers.retain(|w| w.id() != id);
+
+        debug!("del worker size[{}]", self.all_workers.len());
+        Some(worker)
+    }
+
+    /// 检查URL是否匹配此下载管理器的插件
+    ///
+    /// # 参数
+    /// * `url` - 要检查的URL
+    ///
+    /// # 返回
+    /// 如果URL匹配返回true，否则返回false
+    pub fn matches(&self, url: &str) -> Option<Arc<dyn LivePlugin + Send + Sync>> {
+        for plugin in &self.plugins {
+            trace!(
+                platform_name = plugin.name(),
+                url = url,
+                "Found plugin for URL"
+            );
+            if plugin.matches(url) {
+                return Some(plugin.clone());
+            }
+        }
+        None
+    }
+}
+
+fn reuse_vec_arc<'a, T: 'a, U: Iterator<Item = &'a Arc<T>>>(v: &mut U) -> Vec<Arc<T>> {
+    v.into_iter().cloned().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DownloadTask, Monitor, RoomsActor};
+    use crate::server::config::Config;
+    use crate::server::core::downloader::DownloaderRuntime;
+    use crate::server::core::downloader::mesio::Mesio;
+    use crate::server::core::slots::Slots;
+    use crate::server::infrastructure::connection_pool::ConnectionManager;
+    use crate::server::infrastructure::context::Worker;
+    use crate::server::infrastructure::context::{Stage, WorkerStatus};
+    use crate::server::infrastructure::models::live_streamer::LiveStreamer;
+    use async_trait::async_trait;
+    use biliup::downloader::live::{LivePlugin, LiveRequest, LiveResult, LiveStatus};
+    use std::collections::HashSet;
+    use std::sync::{Arc, RwLock};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+
+    /// 始终未开播的平台，每次检测都把房间地址报给测试
+    struct OfflinePlatform {
+        name: &'static str,
+        probed: mpsc::UnboundedSender<String>,
+    }
+
+    #[async_trait]
+    impl LivePlugin for OfflinePlatform {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn matches(&self, url: &str) -> bool {
+            url.starts_with(&format!("https://{}.example/", self.name))
+        }
+
+        async fn check_stream(&self, request: LiveRequest) -> LiveResult<LiveStatus> {
+            let _ = self.probed.send(request.url);
+            Ok(LiveStatus::Offline)
+        }
+    }
+
+    /// 检测一直卡着、放行后报开播的平台
+    struct GatedPlatform {
+        probing: mpsc::UnboundedSender<()>,
+        gate: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl LivePlugin for GatedPlatform {
+        fn name(&self) -> &'static str {
+            "gated"
+        }
+
+        fn matches(&self, url: &str) -> bool {
+            url.starts_with("https://gated.example/")
+        }
+
+        async fn check_stream(&self, request: LiveRequest) -> LiveResult<LiveStatus> {
+            let _ = self.probing.send(());
+            self.gate.notified().await;
+            let stream = serde_json::from_value(serde_json::json!({
+                "name": "gated", "url": request.url, "title": "t", "date": "2026-01-01T00:00:00Z",
+                "live_cover_url": "", "raw_stream_url": "http://127.0.0.1:9/x.flv", "platform": "gated",
+                "stream_headers": {}, "suffix": "flv", "danmaku": null, "downloader_hint": "StreamGears",
+                "runtime_options": null,
+            }))
+            .unwrap();
+            Ok(LiveStatus::Live { stream })
+        }
+    }
+
+    fn worker(id: i64, url: &str) -> Arc<Worker> {
+        let streamer = LiveStreamer {
+            id,
+            url: url.to_string(),
+            remark: url.to_string(),
+            filename_prefix: None,
+            time_range: None,
+            upload_streamers_id: None,
+            format: None,
+            override_cfg: None,
+            preprocessor: None,
+            segment_processor: None,
+            downloaded_processor: None,
+            postprocessor: None,
+            opt_args: None,
+            excluded_keywords: None,
+        };
+        Arc::new(Worker::new(
+            streamer,
+            None,
+            Arc::new(RwLock::new(Config::default())),
+            Default::default(),
+        ))
+    }
+
+    fn recording_task() -> Arc<DownloadTask> {
+        let stream = serde_json::from_value(serde_json::json!({
+            "name": "a", "url": "https://a.example/1", "title": "t", "date": "2026-01-01T00:00:00Z",
+            "live_cover_url": "", "raw_stream_url": "http://127.0.0.1:9/x.flv", "platform": "a",
+            "stream_headers": {}, "suffix": "flv", "danmaku": null, "downloader_hint": "StreamGears",
+            "runtime_options": null,
+        }))
+        .unwrap();
+        Arc::new(DownloadTask::new(
+            DownloaderRuntime::Mesio(Mesio::new()),
+            &stream,
+        ))
+    }
+
+    fn rooms_actor() -> RoomsActor {
+        let (_, messages) = mpsc::channel(1);
+        let mut actor = RoomsActor::new(messages);
+        let (probed, _) = mpsc::unbounded_channel();
+        actor.add_plugin(Arc::new(OfflinePlatform { name: "a", probed }));
+        actor
+    }
+
+    #[tokio::test]
+    async fn finished_recordings_requeue_only_the_task_that_still_owns_the_worker() {
+        let mut actor = rooms_actor();
+        let room = worker(1, "https://a.example/1");
+        actor.add(room.clone()).unwrap();
+        actor.next("a").unwrap();
+        let old_task = recording_task();
+        assert!(room.start_download(old_task.clone(), &room.monitor_changes()));
+
+        // A paused recording must not be returned to monitoring by its cleanup.
+        *room.downloader_status.write().unwrap() = WorkerStatus::Pause;
+        assert!(
+            actor
+                .push_back(1, Some(&room), Some(&old_task), false)
+                .is_none()
+        );
+        assert!(matches!(
+            *room.downloader_status.read().unwrap(),
+            WorkerStatus::Pause
+        ));
+        assert!(actor.platforms["a"].is_empty());
+
+        // Explicit resume may already have started a new check when old cleanup arrives.
+        *room.downloader_status.write().unwrap() = WorkerStatus::Idle;
+        actor.push_back(1, Some(&room), None, true).unwrap();
+        actor.next("a").unwrap();
+        assert!(
+            actor
+                .push_back(1, Some(&room), Some(&old_task), false)
+                .is_none()
+        );
+        assert!(matches!(
+            *room.downloader_status.read().unwrap(),
+            WorkerStatus::Pending
+        ));
+        assert!(actor.platforms["a"].is_empty());
+
+        let resumed_task = recording_task();
+        assert!(room.start_download(resumed_task.clone(), &room.monitor_changes()));
+        assert!(
+            actor
+                .push_back(1, Some(&room), Some(&old_task), false)
+                .is_none()
+        );
+        assert!(matches!(
+            &*room.downloader_status.read().unwrap(),
+            WorkerStatus::Working(task) if Arc::ptr_eq(task, &resumed_task)
+        ));
+        assert!(actor.platforms["a"].is_empty());
+
+        // A normal completion still returns to Idle, once, then can be checked again.
+        actor
+            .push_back(1, Some(&room), Some(&resumed_task), false)
+            .unwrap();
+        assert!(matches!(
+            *room.downloader_status.read().unwrap(),
+            WorkerStatus::Idle
+        ));
+        assert_eq!(actor.platforms["a"].len(), 1);
+        assert!(
+            actor
+                .push_back(1, Some(&room), Some(&resumed_task), false)
+                .is_none()
+        );
+        assert_eq!(actor.platforms["a"].len(), 1);
+        actor.next("a").unwrap();
+        assert!(matches!(
+            *room.downloader_status.read().unwrap(),
+            WorkerStatus::Pending
+        ));
+    }
+
+    #[tokio::test]
+    async fn finishing_a_recording_does_not_requeue_a_replaced_or_deleted_worker() {
+        let mut actor = rooms_actor();
+        let original = worker(1, "https://a.example/1");
+        actor.add(original.clone()).unwrap();
+        actor.next("a").unwrap();
+        let old_task = recording_task();
+        assert!(original.start_download(old_task.clone(), &original.monitor_changes()));
+        actor.del(1).await.unwrap();
+
+        let replacement = worker(1, "https://a.example/1");
+        actor.add(replacement.clone()).unwrap();
+        actor.next("a").unwrap();
+        let new_task = recording_task();
+        assert!(replacement.start_download(new_task.clone(), &replacement.monitor_changes()));
+        assert!(
+            actor
+                .push_back(1, Some(&original), Some(&old_task), false)
+                .is_none()
+        );
+        assert!(matches!(
+            &*replacement.downloader_status.read().unwrap(),
+            WorkerStatus::Working(task) if Arc::ptr_eq(task, &new_task)
+        ));
+        assert!(actor.platforms["a"].is_empty());
+
+        actor.del(1).await.unwrap();
+        assert!(
+            actor
+                .push_back(1, Some(&replacement), Some(&new_task), false)
+                .is_none()
+        );
+        assert!(actor.all_workers.is_empty());
+        assert!(actor.platforms["a"].is_empty());
+    }
+
+    /// 未开播的检测结束就归还下载池槽位，不带着它睡过检测间隔（默认 30 s）：
+    /// 只剩一个空闲槽位时，每个平台的监控循环都还能轮到检测
+    #[tokio::test]
+    async fn an_offline_probe_returns_the_download_slot_before_sleeping() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("data.sqlite3");
+        let pool = ConnectionManager::new_pool(db.to_str().unwrap())
+            .await
+            .unwrap();
+        let (uploader, _) = async_channel::bounded(1);
+        let monitor = Arc::new(Monitor::new(uploader, Arc::new(Slots::new(1)), pool));
+        let (probed_tx, mut probed) = mpsc::unbounded_channel();
+        for name in ["a", "b"] {
+            monitor
+                .add_plugin(Arc::new(OfflinePlatform {
+                    name,
+                    probed: probed_tx.clone(),
+                }))
+                .await;
+        }
+        monitor.add(worker(1, "https://a.example/1")).await.unwrap();
+        monitor.add(worker(2, "https://b.example/2")).await.unwrap();
+
+        let mut seen = HashSet::new();
+        while seen.len() < 2 {
+            let url = tokio::time::timeout(Duration::from_secs(5), probed.recv())
+                .await
+                .expect("两个平台都应在一个检测间隔内轮到检测")
+                .unwrap();
+            seen.insert(url);
+        }
+    }
+
+    /// 检测期间被暂停（界面暂停、Fleet 节点启动时恢复暂停状态）的房间，检测报开播也不开录
+    #[tokio::test]
+    async fn a_room_paused_during_its_live_check_does_not_start_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("data.sqlite3");
+        let pool = ConnectionManager::new_pool(db.to_str().unwrap())
+            .await
+            .unwrap();
+        let (uploader, _) = async_channel::bounded(1);
+        let monitor = Arc::new(Monitor::new(
+            uploader,
+            Arc::new(Slots::new(1)),
+            pool.clone(),
+        ));
+        let (probing, mut probed) = mpsc::unbounded_channel();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        monitor
+            .add_plugin(Arc::new(GatedPlatform {
+                probing,
+                gate: gate.clone(),
+            }))
+            .await;
+        // 场次记录挂在直播间行上：没有这一行，开场次失败，看不出有没有开录
+        sqlx::query("INSERT INTO livestreamers (id, url, remark) VALUES (1, ?, 'gated')")
+            .bind("https://gated.example/1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let room = worker(1, "https://gated.example/1");
+        monitor.add(room.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), probed.recv())
+            .await
+            .expect("房间应当开始检测")
+            .unwrap();
+
+        // 与 `toggle_pause` 对检测中（Pending）房间的做法一致
+        room.change_status(Stage::Download, WorkerStatus::Pause)
+            .await;
+        monitor.make_waker(room.id()).await;
+        gate.notify_one();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(matches!(
+            *room.downloader_status.read().unwrap(),
+            WorkerStatus::Pause
+        ));
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM stream_sessions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(sessions, 0, "没有开场次，也就没有开录");
+        assert!(probed.try_recv().is_err(), "暂停的房间不再被检测");
+    }
+
+    /// 每次检测都报开播的平台，数检测次数
+    struct AlwaysLive {
+        probes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LivePlugin for AlwaysLive {
+        fn name(&self) -> &'static str {
+            "always"
+        }
+
+        fn matches(&self, url: &str) -> bool {
+            url.starts_with("https://always.example/")
+        }
+
+        async fn check_stream(&self, request: LiveRequest) -> LiveResult<LiveStatus> {
+            self.probes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let stream = serde_json::from_value(serde_json::json!({
+                "name": "always", "url": request.url, "title": "t", "date": "2026-01-01T00:00:00Z",
+                "live_cover_url": "", "raw_stream_url": "http://127.0.0.1:9/x.flv", "platform": "always",
+                "stream_headers": {}, "suffix": "flv", "danmaku": null, "downloader_hint": "StreamGears",
+                "runtime_options": null,
+            }))
+            .unwrap();
+            Ok(LiveStatus::Live { stream })
+        }
+    }
+
+    /// 开播了但建场次记录失败（磁盘满、直播间行已被删）：等下一个检测间隔再检测。
+    /// 立刻重新检测的话，只剩这一个房间时会零间隔地反复请求平台接口。
+    #[tokio::test]
+    async fn a_failed_session_insert_waits_for_the_next_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("data.sqlite3");
+        let pool = ConnectionManager::new_pool(db.to_str().unwrap())
+            .await
+            .unwrap();
+        // 不插直播间行：场次记录挂在它上面，开场次必然失败
+        let (uploader, _) = async_channel::bounded(1);
+        let monitor = Arc::new(Monitor::new(uploader, Arc::new(Slots::new(1)), pool));
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        monitor
+            .add_plugin(Arc::new(AlwaysLive {
+                probes: probes.clone(),
+            }))
+            .await;
+        monitor
+            .add(worker(1, "https://always.example/1"))
+            .await
+            .unwrap();
+
+        let probed = || probes.load(std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while probed() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("房间应当开始检测");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(probed(), 1, "建场次失败后应等一个检测间隔（30 s）再检测");
+    }
+
+    /// A pause can return after its stop timeout while the old task is still in a
+    /// platform recheck. Its eventual completion must not overwrite a new task.
+    #[tokio::test]
+    async fn finishing_a_stopped_recording_does_not_replace_its_resumed_task() {
+        use crate::server::core::download_manager::DownloadManager;
+        use crate::server::core::downloader::DownloaderType;
+        use crate::server::services::streamers::toggle_pause;
+        use axum::body::{Body, Bytes};
+        use axum::http::StatusCode;
+        use axum::routing::get;
+        use biliup::downloader::live::LiveStream;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        struct RecheckingPlatform {
+            first: LiveStream,
+            resumed: LiveStream,
+            calls: AtomicUsize,
+            rechecking: mpsc::UnboundedSender<()>,
+            release_old: Arc<Notify>,
+        }
+
+        #[async_trait]
+        impl LivePlugin for RecheckingPlatform {
+            fn name(&self) -> &'static str {
+                "resume-gated"
+            }
+            fn matches(&self, url: &str) -> bool {
+                url.starts_with("https://resume-gated.example/")
+            }
+            async fn check_stream(&self, _: LiveRequest) -> LiveResult<LiveStatus> {
+                match self.calls.fetch_add(1, Ordering::SeqCst) {
+                    0 => Ok(LiveStatus::Live {
+                        stream: Box::new(self.first.clone()),
+                    }),
+                    1 => {
+                        self.rechecking.send(()).unwrap();
+                        self.release_old.notified().await;
+                        Ok(LiveStatus::Offline)
+                    }
+                    _ => Ok(LiveStatus::Live {
+                        stream: Box::new(self.resumed.clone()),
+                    }),
+                }
+            }
+        }
+
+        let _role = crate::server::fleet::ha::test_guard().await;
+        let dir = tempfile::tempdir().unwrap();
+        let pool = ConnectionManager::new_pool(dir.path().join("data.sqlite3").to_str().unwrap())
+            .await
+            .unwrap();
+        let (resumed_tx, mut resumed_rx) = mpsc::unbounded_channel();
+        let release_resumed = Arc::new(Notify::new());
+        let finish_response = release_resumed.clone();
+        let app = axum::Router::new()
+            .route("/first.flv", get(|| async { StatusCode::NOT_FOUND }))
+            .route(
+                "/resumed.flv",
+                get(move || {
+                    resumed_tx.send(()).unwrap();
+                    let finish_response = finish_response.clone();
+                    async move {
+                        Body::from_stream(futures::stream::once(async move {
+                            finish_response.notified().await;
+                            Ok::<Bytes, std::io::Error>(Bytes::new())
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cdn = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let room_url = "https://resume-gated.example/1";
+        sqlx::query("INSERT INTO livestreamers (id, url, remark) VALUES (1, ?, 'resume-gated')")
+            .bind(room_url)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let make_stream = |path: &str| -> LiveStream {
+            serde_json::from_value(serde_json::json!({
+                "name": "resume-gated", "url": room_url, "title": "t", "date": "2026-01-01T00:00:00Z",
+                "live_cover_url": "", "raw_stream_url": format!("http://{address}/{path}.flv"), "platform": "resume-gated",
+                "stream_headers": {}, "suffix": "flv", "danmaku": null, "downloader_hint": "StreamGears", "runtime_options": null
+            })).unwrap()
+        };
+        let (rechecking_tx, mut rechecking_rx) = mpsc::unbounded_channel();
+        let release_old = Arc::new(Notify::new());
+        let config = Config {
+            downloader: Some(DownloaderType::Mesio),
+            event_loop_interval: 3600,
+            ..Config::default()
+        };
+        let managers = Arc::new(DownloadManager::new(
+            config.pool1_size,
+            config.pool2_size,
+            pool,
+        ));
+        let plugin = Arc::new(RecheckingPlatform {
+            first: make_stream("first"),
+            resumed: make_stream("resumed"),
+            calls: AtomicUsize::new(0),
+            rechecking: rechecking_tx,
+            release_old: release_old.clone(),
+        });
+        managers.add_plugin(plugin.clone()).await;
+        let mut streamer = worker(1, room_url).live_streamer.clone();
+        streamer.filename_prefix = Some(
+            dir.path()
+                .join("resume-gated%Y-%m-%dT%H_%M_%S")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        managers
+            .add_room(Worker::new(
+                streamer,
+                None,
+                Arc::new(RwLock::new(config)),
+                Default::default(),
+            ))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), rechecking_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let room = managers.get_room_by_id(1).await.unwrap();
+        let old_task = match &*room.downloader_status.read().unwrap() {
+            WorkerStatus::Working(task) => task.clone(),
+            other => panic!("old recording should be rechecking while Working, got {other:?}"),
+        };
+        // SQLite runs on background threads and does not follow Tokio's clock.
+        // Settle its initialization before advancing only the stop timeout.
+        tokio::time::timeout(Duration::from_secs(5), old_task.settle_recorder())
+            .await
+            .expect("old recorder initialization should finish before advancing time");
+
+        // Use the production pause API and its real stop timeout. Do not resume
+        // until that API has returned, matching sequential browser operations.
+        let pausing = tokio::spawn({
+            let managers = managers.clone();
+            async move { toggle_pause(&managers, 1).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(*room.downloader_status.read().unwrap(), WorkerStatus::Pause) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pause API should publish Pause before waiting for stop");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        pausing.await.unwrap();
+        tokio::time::resume();
+        assert!(matches!(
+            *room.downloader_status.read().unwrap(),
+            WorkerStatus::Pause
+        ));
+
+        toggle_pause(&managers, 1).await;
+        tokio::time::timeout(Duration::from_secs(10), resumed_rx.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "explicit resume should start its HTTP request: status={:?}, probes={}, occupied={}",
+                    *room.downloader_status.read().unwrap(),
+                    plugin.calls.load(Ordering::SeqCst),
+                    managers.download_pool_occupied(),
+                )
+            })
+            .expect("the resumed HTTP handler should report its request");
+        let resumed_task = match &*room.downloader_status.read().unwrap() {
+            WorkerStatus::Working(task) => task.clone(),
+            other => panic!("resumed recording should be Working, got {other:?}"),
+        };
+        assert!(!Arc::ptr_eq(&old_task, &resumed_task));
+        assert_eq!(
+            managers.download_pool_occupied(),
+            2,
+            "both workflows are still alive"
+        );
+
+        release_old.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), old_task.stop())
+            .await
+            .unwrap()
+            .unwrap();
+        let after_old_finished = room.downloader_status.read().unwrap().clone();
+        let kept_resumed_task = matches!(&after_old_finished, WorkerStatus::Working(task) if Arc::ptr_eq(task, &resumed_task));
+        let stopping_resumed = tokio::spawn(async move { resumed_task.stop().await });
+        tokio::task::yield_now().await;
+        release_resumed.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), stopping_resumed)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        managers.del_room(1).await;
+        cdn.abort();
+        assert!(
+            kept_resumed_task,
+            "old workflow overwrote the resumed task: {after_old_finished:?}"
+        );
+    }
+}

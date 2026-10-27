@@ -1,10 +1,11 @@
 ######### 全局录播与上传设置 #########
 #------录制与下载------#
-### 选择全局默认的下载插件，默认为stream-gears。可选：
+### 选择全局默认的下载插件，默认为mesio。可选：
 ### 1.streamlink(streamlink配合ffmpeg混合下载模式，适合用于下载hls_fmp4与hls_ts流，因为streamlink支持多线程拉取）。
 ### 使用该模式下载flv流时，将会仅使用ffmpeg。请手动安装streamlink以及ffmpeg。
 ### 2.ffmpeg（纯ffmpeg下载），请手动安装ffmpeg。
-### 3.stream-gears
+### 3.stream-gears（不支持 HEVC 与 hls_fmp4，FLV 时间戳沿用源站原值）
+### 4.mesio（默认。内置 rust-srec 引擎，进程内下载 FLV/HLS 并修复时间戳、注入关键帧索引，支持按大小/时长分段，无需额外安装）
 #downloader = "ffmpeg"
 ### 录像单文件大小限制，单位Byte，超过此大小分段下载，下载回放时无法使用
 file_size = 2621440000
@@ -20,14 +21,17 @@ filtering_threshold = 20
 #segment_processor_parallel = false
 
 #------上传------#
-### b站提交接口，默认自动选择，可选web，client
-#submit_api = "client"
+### b站投稿接口，默认web，可选web，app，b-cut-android
+#submit_api = "web"
 ### 选择全局默认上传插件，Noop为不上传，但会执行后处理,可选bili_web，biliup-rs(默认值)
 #uploader = "Noop"
-### b站上传线路选择，默认为自动模式，目前可手动切换为bda2, kodo, ws, qn, bldsa, cos, cos-internal(支持腾讯云内网免流+提速，目前已失效)
+### b站上传线路选择，默认自动选择最优线路。目前可手动切换为alia（海外）, bda2（大陆）, bldsa（大陆）, tx（大陆）, txa（海外）, estx（大陆）, akbd（大陆）
 lines = "AUTO"
 ### 单文件并发上传数,未达到带宽上限时,增大此值可提高上传速度(不要设置过大,部分线路限制为8,如速度不佳优先调整上传线路)
 threads = 3
+### 同一分段因断网、超时等网络故障上传失败时最多上传几次（含第一次），两次之间从30秒起翻倍等待、最长5分钟，用完仍失败就跳过该分段、保留文件。
+### 不填为6次，1为不重试。B站限流、风控等拒绝不会重试
+#max_upload_limit = 6
 
 #------杂项------#
 ### 检测到主播下播后延迟再次检测，单位：秒，避免特殊情况提早启动上传导致漏录
@@ -42,6 +46,12 @@ pool1_size = 3
 ### 线程池2大小，负责上传事件。每个上传都会占用1。
 ### 应该设置为比主播数量要多一点的数，如果开启uploading_record需要设置的更多。
 pool2_size = 3
+### 同一主播下播后多少分钟内再开播，接着记在上一场（剪辑台的「直播场次」里算一场），0 为不合并。不影响投稿。
+#live_merge_minutes = 10
+### 投稿后保留录像的小时数：后处理 rm、边录边传投稿后先留这么久再删。0 为立即删除（默认）。
+#retention_hours = 0
+### 录像所在磁盘的最低可用空间（字节），低于它时从最旧的录像开始删。不写或 0 为不启用。
+#min_free_space = 10737418240
 ### 检测源码文件变化间隔，单位：秒，检测源码到变化后，程序会在空闲时自动重启
 check_sourcecode = 15
 
@@ -54,12 +64,20 @@ check_sourcecode = 15
 #------斗鱼------#
 ### 如遇到斗鱼录制卡顿可以尝试切换线路。
 ### tctc-h5（备用线路4）, tct-h5（备用线路5）, ali-h5（备用线路6）, hw-h5（备用线路7）, hs-h5（备用线路13）
-#douyucdn = "tct-h5"
+#douyu_cdn = "tct-h5"
+### 强制hs流使用构造链接，防止部分海外机器遇到频繁断流。使用时需修改douyu_cdn为hs-h5
+#douyu_force_hs = true
+### 网页版登录 Cookie：请求头字符串或浏览器导出 JSON 数组字符串；部分房间的原画需要登录
+#douyu_cookie = ""
+### 斗鱼设备 ID：留空时优先从 Cookie 读取 dy_did/acf_did，再使用默认设备 ID
+#douyu_deviceId = ""
+### 斗鱼视频编码：留空、"AVC" 或 "HEVC"；HEVC 需 mesio 或兼容的新版 FFmpeg，房间不提供时回退 AVC
+#douyu_codec = ""
 ### 录制斗鱼弹幕，默认关闭
 #douyu_danmaku = false
 ### 斗鱼自选画质
 ### 刚开播可能没有除了原画之外的画质 会先录制原画 后续视频分段(仅ffmpeg streamlink)时录制设置的画质
-### 0 原画,4 蓝光4m,3 超清,2 高清
+### 0 请求原画,8 蓝光8m,4 蓝光4m,3 超清,2 高清；实际档位由平台返回，降档会记录日志
 #douyu_rate = 0
 
 
@@ -88,6 +106,10 @@ check_sourcecode = 15
 #------哔哩哔哩------#
 ### 录制BILIBILI弹幕，目前暂时不支持视频按时长分段下的弹幕文件自动分段，默认关闭
 # bilibili_danmaku = false
+### 录制的弹幕信息中包含发送者昵称、用户UID，同时保存醒目留言、上舰、礼物信息。仅 bilibili_danmaku 开启时生效，默认关闭（实验性质：可能与弹幕转ass工具不兼容）
+# bilibili_danmaku_detail = false
+### 录制B站服务器返回的原始弹幕信息，方便有技术能力的用户对主播弹幕数据进行统计。仅 bilibili_danmaku 开启时生效，默认关闭，开启后弹幕文件会每隔5分钟写入一次（实验性质：可能导致弹幕文件巨大）
+# bilibili_danmaku_raw = false
 ### 哔哩哔哩直播流协议.可选 stream（flv流）,hls_ts(ts流）与hls_fmp4（fmp4流），默认为stream
 ### 仅国内IP可以解析到fmp4流。海外IP只能获取到flv流（ov05与ov07）和ts流（ov105）
 ### 由于fmp4出现需要一定时间，或者某些小主播（大部分只有原画选项的主播）无fmp4流。
@@ -95,7 +117,7 @@ check_sourcecode = 15
 ### 由于ffmpeg只能单线程下载，并且stream-gears录制有问题，所以目前fmp4流只能使用streamlink+ffmpeg混合模式。
 #bili_protocol = "stream"
 ### 哔哩哔哩直播优选CDN，默认无
-#bili_perfCDN = "cn-gotcha208,ov-gotcha05"
+#bili_cdn = ["cn-gotcha208", "ov-gotcha05"]
 ### 哔哩哔哩强制真原画（仅限TS与FMP4流的 cn-gotcha01 CDN，且 bili_qn >= 10000），默认为关闭
 ### 不保证可用性。当无法强制获取到真原画时，将会自动回退到二压原画。
 #bili_force_source = false
@@ -106,10 +128,8 @@ check_sourcecode = 15
 ### 大陆机器玩法：bili_liveapi取消注释保持默认使用官方API，并将bili_fallback_api设置为能获取到海外节点API，然后优选fmp4流并使用streamlink下载器，最后设置优选cn-gotcha208,ov-gotcha05两个节点。
 ### 这样大主播可以使用cn208的fmp4流稳定录制（海外机如需可以通过自建dns优选指定线路的cn208节点），没有fmp4流的小主播也可以回退到ov05（网宿线路，包括大陆与海外节点）录制flv流。
 #bili_fallback_api = 'https://api.live.bilibili.com'
-### CDN自动Fallback开关，默认为开启
-#bili_cdn_fallback = true
-### 强制替换ov-gotcha05的下载地址为指定的自选IP
-#bili_force_ov05_ip = "163.171.197.234"
+### CDN自动Fallback开关，默认为关闭
+#bili_cdn_fallback = false
 ### 强制替换cn-gotcha01（叔叔自建，理论上最稳定）为指定的自选域名组（可多个域名，请用逗号分隔）
 ### 完整CDN列表请参考 https://rec.danmuji.org/dev/bilibili-cdn/ 中"B站视频云"的部分
 ### 此功能目前会和stream-gears冲突导致很多分段，请考虑使用ffmpeg录制
@@ -117,8 +137,7 @@ check_sourcecode = 15
 ### 海外机的玩法：配合一个国内的机器（例如便宜的腾讯云，阿里云等等）自建反代api.live.bilibili.com。或者使用https://docs.qq.com/doc/DV2dvbXBrckNscU9x 此处提供的公用反代API
 ### 如果海外机到联通或者移动网络线路还不错，就可以参考***完整CDN列表***选取一些联通或者移动的节点并填入下面
 ### 每次会随机返回填入的其中一个线路，并且会自动判断所填入的节点是否可用
-#bili_force_cn01 = true
-#bili_force_cn01_domains = "cn-jxnc-cm-01-16.bilivideo.com,cn-gddg-cm-01-06.bilivideo.com,cn-fjqz-cm-01-06.bilivideo.com,cn-jssz-cm-01-02.bilivideo.com,cn-gddg-ct-01-12.bilivideo.com"
+#bili_replace_cn01 = ["cn-jxnc-cm-01-16", "cn-gddg-cm-01-06", "cn-fjqz-cm-01-06", "cn-jssz-cm-01-02", "cn-gddg-ct-01-12"]
 ### 哔哩哔哩自选画质
 ### 刚开播可能没有除了原画之外的画质 会先录制原画 后续视频分段(仅ffmpeg streamlink)时录制设置的画质
 ### 30000 杜比,20000 4K,10000 原画,401 蓝光(杜比),400 蓝光,250 超清,150 高清,80 流畅,0 B站默认(多数情况下是蓝光 400)
@@ -204,7 +223,7 @@ description = """
 视频简介: {title} %Y-%m-%d %H:%M:%S
 {streamer}主播直播间地址：{url}
 ---
-Powered By biliup - Github: https://github.com/ForgQi/biliup"""
+Powered By biliup - Github: https://github.com/biliup/biliup"""
 ### 如需在简介中@别人 请使用以下模版
 #credits = [
 #  { username = "需要@的用户名", uid = 需要@的uid }
@@ -214,20 +233,24 @@ Powered By biliup - Github: https://github.com/ForgQi/biliup"""
 #{streamer}主播直播间地址：{url}
 #【@credit】
 #---
-#Powered By biliup - Github: https://github.com/ForgQi/biliup
+#Powered By biliup - Github: https://github.com/biliup/biliup
 #"""
 dynamic = "#空间动态#"
 #dtime = 14_400 ### 设置延时发布时间，距离提交大于2小时，格式为时间戳
 #dolby = 0 ### 是否开启杜比音效, 1为开启
 #hires = 0 ### 是否开启Hi-Res, 1为开启
-#open_elec = 0 ### 是否开启充电面板, 1为开启
+#charging_pay = 0 ### 是否开启充电面板, 1为开启
 #no_reprint = 0 ### 自制声明, 1为未经允许禁止转载
+#is_only_self = 0 ### 可见范围, 1为仅自己可见
+#extra_fields = '<json 字符串>' ### 实现添加自定义提交参数，示例：extra_fields: '{"watermark": {"state": 0}}'自制稿件关闭水印，参数自抓 @https://github.com/biliup/biliup-rs/pull/171
 #uploader = "biliup-rs"  ### 覆盖全局默认上传插件，Noop为不上传，但会执行后处理
 #filename_prefix = '{streamer}%Y-%m-%d %H_%M_%S{title}'  ### 覆盖全局自定义录播文件命名规则
 user_cookie = "cookies.json" ### 使用指定的账号上传
 #use_live_cover = true # 获取BILIBILI直播间封面并作为投稿封面。此封面优先级低于单个主播指定的自定义封面。
 tags = ["biliup", "视频标签"]
-#format = "mp4" ### 视频保存格式。如需使用mp4格式，必须切换downloader为ffmpeg或者streamlink，youtube不支持。
+#format = "mp4" ### 视频保存格式。设置 mp4 时，未配置下载插件或配置为 stream-gears 的主播会自动改用 ffmpeg 转封装；youtube不支持。
+#time_range: "[\"2025-03-26T16:00:00.000Z\",\"2025-03-27T15:59:59.000Z\"]" ### 录制时间范围 ISO 8601 格式的时间数组字符串
+#excluded_keywords: ### 如果房间名包含关键词，则停止或不录制该场直播，每个关键词需单独一行
 ### 开始下载直播时触发，将按自定义顺序执行自定义操作 注：preprocessor仅支持shell指令
 #preprocessor = [
 #    {run = "sh ./run.sh"}, ### 执行任意命令，等同于在shell中运行,preprocessor输出的数据为JSON格式，包含主播名字(name)、开播地址(url)和开播时间(start_time)(时间戳)
@@ -255,7 +278,8 @@ tags = ["biliup", "视频标签"]
 ### ffmpeg参数
 #opt_args = [ "-ss", "00:00:16" # 跳过开始的16秒 ]
 
-
+[streamers."星际2INnoVation吕布卫星人族天梯第一视角".override] ## 覆盖全局配置
+downloader = "sync-downloader"
 
 ################### 用户cookie ###################
 ### 在使用下方配置时，请确认下方第一行（[user]）取消了注释。

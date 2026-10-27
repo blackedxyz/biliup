@@ -1,0 +1,106 @@
+[package]
+name = "biliup-cli"
+version.workspace = true
+edition = "2024"
+# Local SQLx settings and credentials must not enter source distributions.
+exclude = [".env", ".env.*"]
+description = "Upload video to bilibili."
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "biliup"
+path = "src/main.rs"
+
+[dependencies]
+biliup = { path = "../biliup", features = ["cli"] }
+danmaku-client = { package = "danmaku", path = "../danmaku" }
+# 弹幕 XML -> ASS：原生 Rust 排版（crates/danmaku-factory），直接链接进本程序，在本进程内转换
+danmaku-factory = { path = "../danmaku-factory" }
+
+# mesio（rust-srec）：进程内 FLV/HLS 下载 + 修复管线，见 server/core/downloader/mesio.rs
+mesio-engine = { git = "https://github.com/hua0512/rust-srec", rev = "dcdb80ee607ff6a991e5ddd86a0084a01bd945ac" }
+flv-fix = { git = "https://github.com/hua0512/rust-srec", rev = "dcdb80ee607ff6a991e5ddd86a0084a01bd945ac", default-features = false }
+hls-fix = { git = "https://github.com/hua0512/rust-srec", rev = "dcdb80ee607ff6a991e5ddd86a0084a01bd945ac", default-features = false }
+hls = { git = "https://github.com/hua0512/rust-srec", rev = "dcdb80ee607ff6a991e5ddd86a0084a01bd945ac" }
+# 直播预览要把 mesio 管线里的 FlvData 重新编成字节，需要直接引用 flv 的类型（同一 rev，已在 lock 中）
+flv = { git = "https://github.com/hua0512/rust-srec", rev = "dcdb80ee607ff6a991e5ddd86a0084a01bd945ac" }
+pipeline-common = { git = "https://github.com/hua0512/rust-srec", rev = "dcdb80ee607ff6a991e5ddd86a0084a01bd945ac" }
+# 切片工作台给 TS 分段建关键帧索引，按包解析 PAT/PMT/PES（同一 rev，已在 lock 中）
+ts = { git = "https://github.com/hua0512/rust-srec", rev = "dcdb80ee607ff6a991e5ddd86a0084a01bd945ac" }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }  # 添加特性（特性是累加的）  }
+tracing-appender = { workspace = true }
+thiserror = { workspace = true }
+rand = { workspace = true }
+serde_urlencoded = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+time = { workspace = true }
+
+glob = "0.3.2"
+qrcode = "0.14"
+indicatif =  "0.18.0"
+image = "0.25"
+dialoguer = "0.12.0"
+chrono = { workspace = true, features = ["serde"] }
+indexmap = { version = "2.8.0" }
+async-trait = { workspace = true }
+humantime = "2.2.0"
+axum = { version = "0.8", features = ["macros", "ws"] }
+tower-http = { version = "0.6.2", features = ["fs", "cors"] }
+# 自动切片调 OpenAI 兼容接口：chat 发 JSON，转写用 multipart 上传音频
+reqwest = { workspace = true, features = ["json", "multipart"] }
+# 自动切片读弹幕 XML 算密度（与 danmaku crate 同一版本，已在 lock 中）
+quick-xml = { workspace = true }
+sqlx = { version = "0.8", features = [ "runtime-tokio-rustls", "sqlite" ] }
+regex = { workspace = true }
+base64 = "0.22"
+md-5 = "0.10.6"
+libsm = "0.6.0"
+urlencoding = "2.1.3"
+tempfile = "3.14"
+rust-embed = "8.7.2"
+mime_guess = "2.0.5"
+ormlite = { version = "0.24.1", features = ["sqlite", "chrono"] }
+url = { workspace = true }
+error-stack = { workspace = true }
+bon = { workspace = true }
+axum-login = "0.18.0"
+password-auth = "1.0.0"
+tower = "0.5.2"
+tower-sessions = { version = "0.14.0", default-features = false, features = [
+    "signed",
+] }
+tower-sessions-sqlx-store = { version = "0.15.0", features = ["sqlite"] }
+async-channel = { version = "2.5.0" }
+nom = "8"
+tokio-util = "0.7.16"
+libc = "0.2.174"
+once_cell = "1.20"
+# 控制台首页的系统状态（CPU / 内存 / 网速），见 server/common/system_stats.rs；
+# 磁盘容量直接对录制目录调 statvfs / GetDiskFreeSpaceExW，不用 sysinfo 的挂载点列表
+sysinfo = { version = "0.39", default-features = false, features = ["network", "system", "disk"] }
+struct-patch = "0.10.4"
+shellexpand = "3.1"
+dirs = "6.0"
+# Fleet：节点与控制面之间的 iroh QUIC 连接、join 票据与控制面内嵌的 relay，见 server/fleet/。
+# 关掉默认 feature 以去掉 UPnP / NAT-PMP 端口映射与 metrics；TLS 用 biliup 已有的 ring
+iroh = { version = "1.2", default-features = false, features = ["tls-ring"] }
+iroh-tickets = "1"
+iroh-relay = { version = "1.2", default-features = false, features = ["server"] }
+# join 秘密只存摘要
+sha2 = "0.10"
+
+# 系统状态：Windows 上查录制目录所在磁盘的容量（GetDiskFreeSpaceExW）
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Ioctl"] }
+
+[dev-dependencies]
+m3u8-rs = "6"

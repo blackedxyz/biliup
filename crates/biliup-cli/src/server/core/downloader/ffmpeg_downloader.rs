@@ -1,0 +1,646 @@
+use crate::server::common::throughput::SubprocessProgress;
+use crate::server::common::util::{parse_segment_time, redact_process_debug};
+use crate::server::core::downloader::{
+    DownloadConfig, DownloadStatus, DownloaderType, SegmentEvent, SegmentInfo,
+};
+use crate::server::errors::{AppError, AppResult};
+use crate::tools;
+use biliup::downloader::util::ByteCounter;
+use error_stack::{ResultExt, bail};
+use std::path::PathBuf;
+use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::RwLock;
+use tracing::{debug, info, warn};
+
+/// FFmpeg下载器实现
+/// 使用FFmpeg进行直播流下载，支持内部和外部分段
+pub struct FfmpegDownloader {
+    /// 进程句柄
+    process_handle: Arc<RwLock<Option<tokio::process::Child>>>,
+
+    /// 额外的FFmpeg参数
+    pub extra_args: Vec<String>,
+
+    /// 下载器类型
+    pub downloader_type: DownloaderType,
+}
+
+/// 一段录制能否发布（改名为正式文件名并进入上传 / 后处理）。
+///
+/// **未完成的录像一律不删除**：`stop()` 用 SIGKILL 结束 ffmpeg，暂停、删除房间、退出程序、
+/// 断流后的异常退出都会走到这里，删掉 `.part` 就等于丢掉整段（可能是几个小时的）录像。
+///
+/// - ffmpeg 正常结束（0 / 255）：照常发布。
+/// - 被杀或异常退出的 FLV / TS / MKV 等流式容器：截断后仍可播放，照常发布、照常上传。
+/// - 被杀或异常退出的 MP4 / MOV：moov 在结束时才写，截断后无法播放，不发布也不上传，
+///   但 `.part` 文件原样留在磁盘上，供用户手动恢复或自行删除。
+fn publishes_segment(status_code: Option<i32>, suffix: &str) -> bool {
+    matches!(status_code, Some(0) | Some(255))
+        || !matches!(suffix.to_ascii_lowercase().as_str(), "mp4" | "mov")
+}
+
+impl FfmpegDownloader {
+    /// 创建新的FFmpeg下载器实例
+    ///
+    /// # 参数
+    /// * `url` - 流URL
+    /// * `config` - 下载配置
+    /// * `extra_args` - 额外的FFmpeg参数
+    /// * `downloader_type` - 下载器类型
+    pub fn new(extra_args: Vec<String>, downloader_type: DownloaderType) -> Self {
+        Self {
+            process_handle: Arc::new(RwLock::new(None)),
+            extra_args,
+            downloader_type,
+        }
+    }
+
+    /// 构建内部分段模式的FFmpeg命令参数
+    /// 使用FFmpeg的segment muxer进行自动分段
+    fn build_ffmpeg_args_internal_segment(&self, download_config: &DownloadConfig) -> Vec<String> {
+        let mut args = Vec::new();
+
+        // 内部分段使用info级别日志以获取分段信息
+        args.extend(["-loglevel".to_string(), "info".to_string()]);
+
+        // 添加通用输入参数
+        self.append_common_input_args(&mut args, download_config);
+
+        // 内部分段特定的输出参数
+        // -f segment: 使用segment muxer进行自动分段
+        args.extend(["-f".to_string(), "segment".to_string()]);
+        args.extend([
+            "-segment_format".to_string(),
+            download_config.suffix.to_string(),
+        ]);
+        // -segment_list pipe:1: 将分段文件名输出到stdout
+        // 这样我们可以实时获取新生成的分段文件
+        args.extend(["-segment_list".to_string(), "pipe:1".to_string()]);
+        args.extend(["-map".to_string(), "0".to_string()]);
+
+        // -segment_list_type flat: 输出格式为纯文件名列表
+        args.extend(["-segment_list_type".to_string(), "flat".to_string()]);
+
+        // -reset_timestamps 1: 每个分段重置时间戳从0开始
+        // 确保每个分段文件可以独立播放
+        args.extend(["-reset_timestamps".to_string(), "1".to_string()]);
+        // %Y-%m-%dT%H_%M_%S 是 strftime 的时间占位符（需要配合 -strftime 1）
+        // %d 是序号占位符（printf 风格，默认模式）
+        // segment 复用器不能同时用这两种
+        args.extend(["-strftime".to_string(), "1".to_string()]);
+
+        // -segment_time: 分段时长（秒）
+        if let Some(duration) = download_config
+            .segment_time
+            .as_deref()
+            .and_then(parse_segment_time)
+            .filter(|duration| !duration.is_zero())
+        {
+            args.extend([
+                "-segment_time".to_string(),
+                duration.as_secs_f64().to_string(),
+            ]);
+        }
+
+        // -t: 录制总时长上限。内部分段由 segment muxer 自己切片、进程不会自行退出，
+        // 所以要用总时长把录制截停在录制时间范围的结束时刻。
+        if let Some(remaining) = download_config.time_range_remaining() {
+            args.extend(["-t".to_string(), remaining]);
+        }
+
+        // 添加通用输出参数
+        self.append_common_output_args(&mut args, "segment");
+
+        args
+    }
+
+    /// 构建外部分段模式的FFmpeg命令参数
+    /// 通过外部控制进行分段，每次录制固定时长或大小
+    fn build_ffmpeg_args_external_segment(&self, download_config: &DownloadConfig) -> Vec<String> {
+        let mut args = Vec::new();
+
+        // 外部分段使用quiet减少日志
+        args.extend(["-loglevel".to_string(), "quiet".to_string()]);
+
+        // 添加通用输入参数
+        self.append_common_input_args(&mut args, download_config);
+
+        // 外部分段特定的输出参数
+        // -to: 限制录制时长，快到录制时间范围结束时会被裁短，使录制停在窗口边界
+        if let Some(segment_time) = download_config.segment_duration() {
+            args.extend(["-to".to_string(), segment_time]);
+        }
+
+        // -fs: 限制文件大小（字节）
+        if let Some(file_size) = download_config.file_size {
+            args.extend(["-fs".to_string(), file_size.to_string()]);
+        }
+
+        // 添加通用输出参数
+        self.append_common_output_args(&mut args, &download_config.suffix);
+
+        args
+    }
+
+    /// 添加通用的输入参数
+    /// 包括覆盖文件、HTTP头、超时设置等
+    fn append_common_input_args(&self, args: &mut Vec<String>, download_config: &DownloadConfig) {
+        args.push("-y".to_string()); // 覆盖已存在文件
+
+        // -progress pipe:2: 把 key=value 形式的进度（含累计写出字节 total_size）打到 stderr，
+        // 由 spawn_log 解析出写盘速率；不受 -loglevel 影响。
+        // -nostats: 关掉同样写 stderr、以 \r 刷新的单行统计，避免与进度行混在一起
+        args.extend(["-progress".to_string(), "pipe:2".to_string()]);
+        args.push("-nostats".to_string());
+
+        // HTTP headers
+        // -headers: 设置HTTP请求头，格式为"Key: Value\r\n"
+        // 用于传递User-Agent、Cookie等信息
+        if !download_config.headers.is_empty() {
+            let headers_str = download_config
+                .headers
+                .iter()
+                .map(|(k, v)| format!("{}: {}\r\n", k, v))
+                .collect::<String>();
+            args.extend(["-headers".to_string(), headers_str]);
+        }
+
+        // -rw_timeout: 读写超时时间（微秒）
+        // 防止网络卡顿导致无限等待
+        args.extend(["-rw_timeout".to_string(), "20000000".to_string()]);
+
+        // 对于m3u8流的特殊处理
+        if download_config.url.contains(".m3u8") {
+            // -max_reload: HLS播放列表最大重载次数
+            // 对于直播流需要设置较大值以持续获取新片段
+            args.extend(["-max_reload".to_string(), "1000".to_string()]);
+        }
+
+        // 输入URL
+        args.extend(["-i".to_string(), download_config.url.clone()]);
+    }
+
+    /// 添加通用的输出参数
+    /// 包括编码设置、格式特定参数等
+    fn append_common_output_args(&self, args: &mut Vec<String>, format: &str) {
+        // -c copy: 直接复制编码，不重新编码
+        // 减少CPU使用，保持原始质量
+        args.extend(["-c".to_string(), "copy".to_string()]);
+
+        // 格式特定参数
+        match format {
+            "mp4" => {
+                // -bsf:a aac_adtstoasc: 音频比特流过滤器
+                // 将ADTS格式的AAC转换为MP4容器所需的格式
+                args.extend(["-bsf:a".to_string(), "aac_adtstoasc".to_string()]);
+
+                // -movflags +faststart: 优化MP4用于流媒体播放
+                // 将moov atom移到文件开头，允许边下载边播放
+                args.extend(["-movflags".to_string(), "+faststart".to_string()]);
+
+                args.extend(["-f".to_string(), "mp4".to_string()]);
+            }
+            "ts" => {
+                args.extend(["-f".to_string(), "mpegts".to_string()]);
+            }
+            "mkv" => {
+                args.extend(["-f".to_string(), "matroska".to_string()]);
+            }
+            "flv" => {
+                args.extend(["-f".to_string(), "flv".to_string()]);
+            }
+            _ => {}
+        }
+
+        // 添加额外参数
+        args.extend(self.extra_args.clone());
+    }
+
+    /// 执行外部分段下载
+    /// 每次录制一个完整的分段文件
+    async fn download_external<'a>(
+        &self,
+        mut callback: Box<dyn FnMut(SegmentEvent) + Send + Sync + 'a>,
+        download_config: DownloadConfig,
+    ) -> AppResult<DownloadStatus> {
+        let args = self.build_ffmpeg_args_external_segment(&download_config);
+        let output_file = download_config.generate_output_filename(&download_config.suffix);
+
+        let part_file = format!("{}.part", output_file.display());
+        let mut cmd = tools::ffmpeg_command();
+        cmd.args(&args)
+            .arg(&part_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        info!(cmd = %redact_process_debug(&cmd), "Starting ffmpeg download");
+        let child = cmd.spawn().change_context(AppError::Unknown)?;
+        callback(SegmentEvent::Start {
+            next_file_path: PathBuf::from(&part_file),
+        });
+
+        let status = spawn_log(
+            child,
+            &self.process_handle,
+            download_config.bytes_written.clone(),
+        )
+        .await?;
+        let status_code = status.code();
+        if !publishes_segment(status_code, &download_config.suffix) {
+            // 截断的 MP4 没有 moov：不进入上传流程，但 `.part` 文件不删除（见 publishes_segment），
+            // 留在磁盘上供手动恢复。
+            warn!(
+                part_file,
+                ?status_code,
+                "ffmpeg exited before finishing the MP4 trailer, not publishing the segment"
+            );
+            return Ok(DownloadStatus::Error(format!(
+                "FFmpeg error: {status_code:?}"
+            )));
+        }
+        // 退出时，重命名文件
+        tokio::fs::rename(&part_file, &output_file)
+            .await
+            .change_context(AppError::Custom(String::from("退出时，重命名文件")))?;
+        // let (tx, rx) = bounded(16);
+        // 分段回调
+        // 触发分段回调
+
+        callback(SegmentEvent::Segment(SegmentInfo {
+            prev_file_path: output_file,
+            danmaku_file_path: None,
+            segment_index: 0,
+            next_file_path: None,
+            duration_secs: None,
+            size_bytes: None,
+            ready: None,
+        }));
+        // 根据退出码判断状态
+        match status_code {
+            Some(0) => Ok(DownloadStatus::SegmentCompleted),
+            Some(255) => Ok(DownloadStatus::StreamEnded),
+            err => Ok(DownloadStatus::Error(format!("FFmpeg error: {err:?}"))),
+        }
+    }
+
+    /// 执行内部分段下载
+    /// 使用FFmpeg的segment muxer自动分段
+    async fn download_internal<'a>(
+        &self,
+        mut callback: Box<dyn FnMut(SegmentEvent) + Send + Sync + 'a>,
+        download_config: DownloadConfig,
+    ) -> AppResult<DownloadStatus> {
+        let args = self.build_ffmpeg_args_internal_segment(&download_config);
+
+        let mut cmd = tools::ffmpeg_command();
+        cmd.args(&args)
+            .arg(format!(
+                "{}.{}.part",
+                download_config.recorder.filename_template(),
+                download_config.suffix
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+
+        info!("FFmpeg cmd: {}", redact_process_debug(&cmd));
+        let mut child = cmd.spawn().change_context(AppError::Unknown)?;
+
+        // 获取stdout用于读取分段文件名
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or(AppError::Custom("Failed to capture stdout".to_string()))?;
+
+        // 异步读取stdout
+        let mut reader = BufReader::new(stdout).lines();
+        let mut segment_index = 0;
+        let mut prev_file_path: Option<PathBuf> = None;
+
+        while let Some(line) = reader.next_line().await.change_context(AppError::Unknown)? {
+            // 解析文件名
+            let file_path = PathBuf::from(line.trim());
+
+            // 等待文件写入完成
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+            // 触发分段回调
+
+            // 重命名文件
+            let no_ext = file_path.with_extension("");
+            tokio::fs::rename(&file_path, &no_ext)
+                .await
+                .change_context(AppError::Unknown)?;
+            info!("renamed file: from {file_path:?} to {no_ext:?}");
+
+            callback(SegmentEvent::Segment(SegmentInfo {
+                prev_file_path: no_ext,
+                danmaku_file_path: None,
+                next_file_path: None,
+                segment_index,
+                duration_secs: None,
+                size_bytes: None,
+                ready: None,
+                // start_time: std::time::SystemTime::now(),
+                // end_time: std::time::SystemTime::now(),
+            }));
+
+            segment_index += 1;
+            prev_file_path = Some(file_path);
+        }
+        let status = spawn_log(
+            child,
+            &self.process_handle,
+            download_config.bytes_written.clone(),
+        )
+        .await?;
+
+        if let Some(file_path) = prev_file_path {
+            // 重命名文件
+            let no_ext = file_path.with_extension("");
+            tokio::fs::rename(&file_path, &no_ext)
+                .await
+                .change_context(AppError::Unknown)?;
+            callback(SegmentEvent::Segment(SegmentInfo {
+                prev_file_path: no_ext,
+                danmaku_file_path: None,
+                next_file_path: None,
+                segment_index,
+                duration_secs: None,
+                size_bytes: None,
+                ready: None,
+                // start_time: std::time::SystemTime::now(),
+                // end_time: std::time::SystemTime::now(),
+            }));
+        }
+
+        // 根据退出码判断状态
+        match status.code() {
+            Some(0) => {
+                // 正常退出
+                Ok(DownloadStatus::SegmentCompleted)
+            }
+            Some(255) => Ok(DownloadStatus::StreamEnded),
+            err => Ok(DownloadStatus::Error(format!("FFmpeg error: {err:?}"))),
+        }
+    }
+}
+
+impl FfmpegDownloader {
+    pub(crate) async fn download<'a>(
+        &self,
+        callback: Box<dyn FnMut(SegmentEvent) + Send + Sync + 'a>,
+        download_config: DownloadConfig,
+    ) -> AppResult<DownloadStatus> {
+        match self.downloader_type {
+            DownloaderType::FfmpegExternal => self
+                .download_external(callback, download_config)
+                .await
+                .change_context(AppError::Unknown),
+            DownloaderType::FfmpegInternal => self
+                .download_internal(callback, download_config)
+                .await
+                .change_context(AppError::Unknown),
+            _ => bail!(AppError::Custom("Unsupported downloader type".to_string())),
+        }
+    }
+
+    pub(crate) async fn stop(&self) -> AppResult<()> {
+        let mut handle = self.process_handle.write().await;
+        if let Some(child) = &mut *handle {
+            child.kill().await.change_context(AppError::Unknown)?;
+            Ok(())
+        } else {
+            Err(AppError::Custom("Process handle not found".to_string()).into())
+        }
+    }
+
+    // async fn get_status(&self) -> DownloadStatus {
+    //     self.status.read().await.clone()
+    // }
+}
+
+/// 等待 ffmpeg 结束，期间把 stderr 转成日志；`-progress` 的进度行不打日志，
+/// 只把 `total_size` 的增量累加到 `bytes_written`（写盘速率的来源）。
+async fn spawn_log(
+    mut child: tokio::process::Child,
+    process_handle: &RwLock<Option<tokio::process::Child>>,
+    bytes_written: ByteCounter,
+) -> AppResult<ExitStatus> {
+    let stderr = child.stderr.take().ok_or(AppError::Custom(
+        "failed to capture stderr pipe".to_string(),
+    ))?;
+
+    // 保存进程句柄
+    {
+        let mut handle = process_handle.write().await;
+        *handle = Some(child);
+    }
+
+    let mut stderr_lines = BufReader::new(stderr).lines();
+    // 将 stderr 打印到当前进程的 stderr；进度行只解析不打印
+    let stderr_task = tokio::spawn(async move {
+        let mut progress = SubprocessProgress::default();
+        while let Ok(Some(line)) = stderr_lines.next_line().await {
+            if progress.observe_ffmpeg(&line, &bytes_written) {
+                debug!("[ffmpeg] {line}");
+                continue;
+            }
+            info!("[ffmpeg] {line}");
+        }
+    });
+
+    // 确保读任务结束（忽略它们的返回错误以避免因提前关闭管道导致的 join 错）
+    let _ = stderr_task.await;
+
+    // 等待进程结束
+    let status = {
+        let mut handle = process_handle.write().await;
+        if let Some(mut child) = handle.take() {
+            child.wait().await.change_context(AppError::Unknown)?
+        } else {
+            bail!(AppError::Custom("Process handle not found".to_string()));
+        }
+    };
+    Ok(status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
+
+    /// 以「当前时刻」为基准造一个录制时间范围，形态与前端 `Date.toISOString()` 写出的一致。
+    /// 相对当前时刻取值，因此走的是真实时钟，也顺带覆盖了窗口跨过零点的情形。
+    fn window(starts_in: i64, ends_in: i64) -> String {
+        let now = Utc::now();
+        let iso = |offset: i64| {
+            (now + ChronoDuration::seconds(offset)).to_rfc3339_opts(SecondsFormat::Millis, true)
+        };
+        format!(r#"["{}","{}"]"#, iso(starts_in), iso(ends_in))
+    }
+
+    fn config(segment_time: Option<&str>, time_range: Option<String>) -> DownloadConfig {
+        DownloadConfig {
+            segment_time: segment_time.map(str::to_owned),
+            time_range,
+            suffix: "flv".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn value_of(args: &[String], flag: &str) -> Option<String> {
+        let index = args.iter().position(|arg| arg == flag)?;
+        args.get(index + 1).cloned()
+    }
+
+    fn seconds_of(args: &[String], flag: &str) -> u32 {
+        let raw = value_of(args, flag).unwrap_or_else(|| panic!("命令行里应有 {flag}"));
+        let parts: Vec<u32> = raw
+            .split(':')
+            .map(|p| p.parse().expect("时长应为 HH:MM:SS"))
+            .collect();
+        parts[0] * 3600 + parts[1] * 60 + parts[2]
+    }
+
+    fn external() -> FfmpegDownloader {
+        FfmpegDownloader::new(Vec::new(), DownloaderType::FfmpegExternal)
+    }
+
+    fn internal() -> FfmpegDownloader {
+        FfmpegDownloader::new(Vec::new(), DownloaderType::FfmpegInternal)
+    }
+
+    #[test]
+    fn truncated_mp4_is_not_published_but_streamable_containers_are() {
+        for code in [Some(0), Some(255)] {
+            assert!(publishes_segment(code, "mp4"));
+            assert!(publishes_segment(code, "flv"));
+        }
+        for code in [None, Some(1)] {
+            assert!(!publishes_segment(code, "mp4"));
+            assert!(!publishes_segment(code, "MOV"));
+            assert!(publishes_segment(code, "flv"));
+            assert!(publishes_segment(code, "ts"));
+        }
+    }
+
+    #[test]
+    fn both_modes_ask_ffmpeg_for_machine_readable_progress_on_stderr() {
+        for args in [
+            external().build_ffmpeg_args_external_segment(&config(None, None)),
+            internal().build_ffmpeg_args_internal_segment(&config(None, None)),
+        ] {
+            assert_eq!(value_of(&args, "-progress"), Some("pipe:2".to_string()));
+            assert!(args.contains(&"-nostats".to_string()));
+            // 全局选项必须在 -i 之前
+            let progress_at = args.iter().position(|a| a == "-progress").unwrap();
+            let input_at = args.iter().position(|a| a == "-i").unwrap();
+            assert!(progress_at < input_at);
+        }
+    }
+
+    #[test]
+    fn extra_args_are_the_last_output_options_in_both_modes() {
+        // 排在 -c copy 和格式参数之后、调用方追加的输出文件名之前，作用于录制的输出文件
+        let extra = vec!["-metadata".to_string(), "comment=opt-args".to_string()];
+        for (mode, args) in [
+            (
+                DownloaderType::FfmpegExternal,
+                FfmpegDownloader::new(extra.clone(), DownloaderType::FfmpegExternal)
+                    .build_ffmpeg_args_external_segment(&config(None, None)),
+            ),
+            (
+                DownloaderType::FfmpegInternal,
+                FfmpegDownloader::new(extra.clone(), DownloaderType::FfmpegInternal)
+                    .build_ffmpeg_args_internal_segment(&config(None, None)),
+            ),
+        ] {
+            assert!(args.ends_with(&extra), "{mode:?}: {args:?}");
+            let copy_at = args.iter().position(|a| a == "-c").unwrap();
+            assert!(copy_at < args.len() - extra.len(), "{mode:?}: {args:?}");
+        }
+    }
+
+    #[test]
+    fn without_a_time_range_the_segment_time_reaches_ffmpeg_unchanged() {
+        let args = external().build_ffmpeg_args_external_segment(&config(Some("01:00:00"), None));
+        assert_eq!(value_of(&args, "-to"), Some("01:00:00".to_string()));
+    }
+
+    #[test]
+    fn without_a_segment_time_or_window_ffmpeg_gets_no_duration_limit() {
+        let args = external().build_ffmpeg_args_external_segment(&config(None, None));
+        assert_eq!(value_of(&args, "-to"), None);
+    }
+
+    #[test]
+    fn a_far_away_window_end_leaves_the_segment_time_alone() {
+        // 窗口还剩 2 小时，1 小时的分段时长不该被动
+        let args = external()
+            .build_ffmpeg_args_external_segment(&config(Some("01:00:00"), Some(window(-60, 7200))));
+        assert_eq!(value_of(&args, "-to"), Some("01:00:00".to_string()));
+    }
+
+    #[test]
+    fn a_near_window_end_shortens_the_segment_so_recording_stops_on_the_boundary() {
+        // 窗口只剩 10 分钟，1 小时的分段必须被裁到 10 分钟，否则会冲出窗口 50 分钟
+        let args = external()
+            .build_ffmpeg_args_external_segment(&config(Some("01:00:00"), Some(window(-60, 600))));
+        let to = seconds_of(&args, "-to");
+        assert!((595..=600).contains(&to), "-to 应约为 600 秒，实际 {to}");
+    }
+
+    #[test]
+    fn a_window_bounds_recording_even_when_no_segment_time_is_configured() {
+        // Python 版这种情况根本不下发 -to，会一直录到直播结束
+        let args =
+            external().build_ffmpeg_args_external_segment(&config(None, Some(window(-60, 600))));
+        let to = seconds_of(&args, "-to");
+        assert!((595..=600).contains(&to), "-to 应约为 600 秒，实际 {to}");
+    }
+
+    #[test]
+    fn internal_segmentation_caps_total_duration_at_the_window_end() {
+        // 内部分段的 -segment_time 只是切片间隔，进程不会自己退出，必须靠 -t 截停
+        let args = internal()
+            .build_ffmpeg_args_internal_segment(&config(Some("01:00:00"), Some(window(-60, 600))));
+        assert_eq!(value_of(&args, "-segment_time"), Some("3600".to_string()));
+        let total = seconds_of(&args, "-t");
+        assert!(
+            (595..=600).contains(&total),
+            "-t 应约为 600 秒，实际 {total}"
+        );
+    }
+
+    #[test]
+    fn internal_segmentation_has_no_total_cap_without_a_window() {
+        let args = internal().build_ffmpeg_args_internal_segment(&config(Some("01:00:00"), None));
+        assert_eq!(value_of(&args, "-segment_time"), Some("3600".to_string()));
+        assert_eq!(value_of(&args, "-t"), None);
+    }
+
+    #[test]
+    fn custom_duration_formats_and_subseconds_reach_both_ffmpeg_segmentation_modes() {
+        for (duration, seconds) in [
+            ("00:07:30", "450"),
+            ("7:30", "450"),
+            ("450", "450"),
+            ("00:07:30.5", "450.5"),
+        ] {
+            let config = config(Some(duration), None);
+            let internal_args = internal().build_ffmpeg_args_internal_segment(&config);
+            assert_eq!(
+                value_of(&internal_args, "-segment_time").as_deref(),
+                Some(seconds)
+            );
+            let external_args = external().build_ffmpeg_args_external_segment(&config);
+            assert_eq!(value_of(&external_args, "-to").as_deref(), Some(duration));
+        }
+    }
+}

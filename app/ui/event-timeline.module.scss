@@ -1,0 +1,88 @@
+/* 最近事件时间线 */
+
+.timeline {
+  position: relative;
+  margin: 0;
+  padding-left: 22px;
+  list-style: none;
+  min-width: 0;
+}
+.groups { display: grid; gap: 20px; min-width: 0; }
+.date { margin: 0 0 12px; font-size: 12px; font-weight: 600; color: var(--semi-color-text-1); }
+.meta { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 4px 12px; min-width: 0; }
+
+.timeline::before {
+  content: '';
+  position: absolute;
+  left: 6px;
+  top: 4px;
+  bottom: 4px;
+  width: 2px;
+  background: var(--semi-color-fill-1);
+  border-radius: 2px;
+}
+
+.item {
+  position: relative;
+  padding: 5px 0 12px;
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.item::before {
+  content: '';
+  position: absolute;
+  left: -20px;
+  top: 9px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--semi-color-bg-1);
+  border: 2px solid var(--semi-color-text-2);
+}
+
+.item.start::before {
+  border-color: rgb(var(--semi-green-5));
+}
+
+.item.file::before {
+  border-color: rgb(var(--semi-blue-4));
+}
+
+.time {
+  font-size: 12px;
+  color: var(--semi-color-text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.text {
+  font-size: 13px;
+  color: var(--semi-color-text-1);
+  min-width: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.6;
+}
+
+.tag {
+  font-size: 11px;
+  color: var(--semi-color-text-2);
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.link {
+  flex-shrink: 0;
+  color: var(--semi-color-primary);
+  font-size: 12px;
+  text-decoration: none;
+}
+
+.link:hover { text-decoration: underline; }
+
+.empty {
+  padding: 28px 20px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--semi-color-text-2);
+}

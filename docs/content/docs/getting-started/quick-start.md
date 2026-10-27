@@ -9,6 +9,7 @@ sort_by = "weight"
 template = "docs/page.html"
 
 [extra]
+language_code = "en-US"
 lead = "One page summary of how to start a new biliup project."
 toc = true
 top = false
@@ -22,7 +23,7 @@ Before using the biliup, you need to install the [python](https://www.python.org
 
 ```bash
 pipx install biliup
-biliup --http
+biliup
 ```
 
 Visit `http://127.0.0.1:19159/` in the browser.

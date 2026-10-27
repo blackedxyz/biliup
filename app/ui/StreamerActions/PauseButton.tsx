@@ -1,0 +1,55 @@
+import React, { useState } from 'react';
+import { useSWRConfig } from 'swr';
+import useSWRMutation from 'swr/mutation';
+import {Button} from "@douyinfe/semi-ui";
+import type {ButtonProps} from "@douyinfe/semi-ui/lib/es/button";
+import {IconPause, IconPlay} from "@douyinfe/semi-icons";
+import {LiveStreamerEntity, proxy} from "@/app/lib/api-streamer";
+
+interface PauseButtonProps extends Omit<ButtonProps, 'onClick' | 'icon' | 'theme' | 'onError'> {
+    streamer: LiveStreamerEntity;
+    onSuccess?: () => void;
+    onError?: (error: Error) => void;
+}
+
+// 暂停主播
+// 走统一的响应处理：未登录跳转登录页，没有权限时提示，其它失败抛给调用方
+export const pauseStreamer = (url: string) => proxy(url, { method: 'PUT' });
+
+export const PauseButton: React.FC<PauseButtonProps> = ({
+                                                            streamer,
+                                                            onSuccess,
+                                                            onError,
+                                                            type = 'tertiary',
+                                                            ...rest
+                                                        }) => {
+    const { mutate } = useSWRConfig();
+
+    const { trigger: pauseTrigger } = useSWRMutation(
+        `/v1/streamers/${streamer.id}/pause`,
+        pauseStreamer
+    );
+
+    const handlePause = async () => {
+        try {
+            await pauseTrigger();
+            // 重新加载列表数据
+            await mutate('/v1/streamers');
+            onSuccess?.();
+        } catch (error) {
+            console.error('暂停失败:', error);
+            onError?.(error as Error);
+        }
+    };
+
+    return (
+        <Button
+            onClick={handlePause}
+            icon={streamer.status === 'Pause' ? <IconPlay /> : <IconPause />}
+            theme="borderless"
+            type={type}
+            {...rest}
+            aria-label={streamer.status === 'Pause' ? '恢复监控' : '暂停监控'}
+        />
+    );
+};

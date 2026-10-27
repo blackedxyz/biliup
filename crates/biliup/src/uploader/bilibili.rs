@@ -1,0 +1,1306 @@
+use crate::ReqwestClientBuilderExt;
+use crate::error::{Kind, Result};
+use crate::uploader::credential::LoginInfo;
+use serde::ser::Error;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::collections::HashMap;
+
+use bon::Builder;
+use std::fmt::{Display, Formatter};
+use std::num::ParseIntError;
+use std::str::FromStr;
+use std::time::Duration;
+use tracing::{info, warn};
+
+#[derive(Serialize, Deserialize, Debug, Builder)]
+#[cfg_attr(feature = "cli", derive(clap::Args))]
+pub struct Studio {
+    /// 是否转载, 1-自制 2-转载
+    #[cfg_attr(feature = "cli", clap(long, default_value = "1"))]
+    #[builder(default = 1)]
+    #[serde(default = "default_copyright")]
+    pub copyright: u8,
+
+    /// 转载来源
+    #[cfg_attr(feature = "cli", clap(long, default_value_t))]
+    #[serde(default)]
+    pub source: String,
+
+    /// 投稿分区
+    #[cfg_attr(feature = "cli", clap(long, default_value = "171"))]
+    #[builder(default = 171)]
+    pub tid: u16,
+
+    /// 新版投稿分区 tid_v2（可选；不设置时不提交该字段）
+    #[cfg_attr(feature = "cli", clap(long))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tid_v2: Option<u32>,
+
+    /// 视频封面
+    #[cfg_attr(feature = "cli", clap(long, default_value_t))]
+    #[serde(default)]
+    pub cover: String,
+
+    /// 视频标题
+    #[cfg_attr(feature = "cli", clap(long, default_value_t))]
+    pub title: String,
+
+    #[cfg_attr(feature = "cli", clap(skip))]
+    #[serde(default)]
+    #[builder(default)]
+    pub desc_format_id: u32,
+
+    /// 视频简介
+    #[cfg_attr(feature = "cli", clap(long, default_value_t))]
+    #[serde(default)]
+    pub desc: String,
+
+    /// 视频简介v2
+    #[serde(default)]
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub desc_v2: Option<Vec<Credit>>,
+
+    /// 空间动态
+    #[cfg_attr(feature = "cli", clap(long, default_value_t))]
+    #[serde(default)]
+    pub dynamic: String,
+
+    #[cfg_attr(feature = "cli", clap(skip))]
+    #[serde(default)]
+    #[builder(default)]
+    pub subtitle: Subtitle,
+
+    /// 视频标签，逗号分隔多个tag
+    #[cfg_attr(feature = "cli", clap(long, default_value_t))]
+    #[serde(default)]
+    pub tag: String,
+
+    #[serde(default)]
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub videos: Vec<Video>,
+
+    /// 延时发布时间，距离提交大于4小时，格式为10位时间戳
+    #[cfg_attr(feature = "cli", clap(long))]
+    pub dtime: Option<u32>,
+
+    #[cfg_attr(feature = "cli", clap(skip))]
+    #[serde(default)]
+    #[builder(default)]
+    pub open_subtitle: bool,
+
+    #[cfg_attr(feature = "cli", clap(long, default_value = "0"))]
+    #[serde(default)]
+    #[builder(default)]
+    pub interactive: u8,
+
+    #[cfg_attr(feature = "cli", clap(long))]
+    #[serde(default)]
+    pub mission_id: Option<u32>,
+
+    // #[clap(long, default_value = "0")]
+    // pub act_reserve_create: u8,
+    /// 是否开启杜比音效, 0-关闭 1-开启
+    #[cfg_attr(feature = "cli", clap(long, default_value = "0"))]
+    #[serde(default)]
+    pub dolby: u8,
+
+    /// 是否开启 Hi-Res, 0-关闭 1-开启
+    #[cfg_attr(feature = "cli", clap(long = "hires", default_value = "0"))]
+    #[serde(default)]
+    #[builder(default)]
+    pub lossless_music: u8,
+
+    /// 0-允许转载，1-禁止转载
+    #[cfg_attr(feature = "cli", clap(long, default_value = "0"))]
+    #[serde(default)]
+    pub no_reprint: u8,
+
+    /// 仅自己可见
+    #[cfg_attr(feature = "cli", clap(long))]
+    #[serde(default)]
+    pub is_only_self: Option<u8>,
+
+    /// 是否开启充电, 0-关闭 1-开启
+    #[cfg_attr(feature = "cli", clap(long, default_value = "0"))]
+    #[serde(default)]
+    pub charging_pay: u8,
+
+    /// aid 要追加视频的 avid
+    #[cfg_attr(feature = "cli", clap(skip))]
+    pub aid: Option<u64>,
+
+    /// 是否开启精选评论，仅提交接口为app时可用
+    #[cfg_attr(feature = "cli", clap(long))]
+    #[serde(default)]
+    pub up_selection_reply: bool,
+
+    /// 是否关闭评论，仅提交接口为app时可用
+    #[cfg_attr(feature = "cli", clap(long))]
+    #[serde(default)]
+    pub up_close_reply: bool,
+
+    /// 是否关闭弹幕，仅提交接口为app时可用
+    #[cfg_attr(feature = "cli", clap(long))]
+    #[serde(default)]
+    pub up_close_danmu: bool,
+
+    /// 自定义提交参数
+    #[cfg_attr(feature = "cli", clap(long, value_parser = parse_extra_fields))]
+    #[serde(flatten)]
+    pub extra_fields: Option<HashMap<String, Value>>,
+}
+
+#[cfg(feature = "cli")]
+fn parse_extra_fields(s: &str) -> std::result::Result<HashMap<String, Value>, String> {
+    serde_json::from_str(s).map_err(|e| e.to_string())
+}
+
+fn default_copyright() -> u8 {
+    1
+}
+
+#[derive(Default, Debug, Serialize, Deserialize)]
+pub struct Archive {
+    pub aid: u64,
+    pub bvid: String,
+    pub title: String,
+    pub cover: String,
+    pub reject_reason: String,
+    pub reject_reason_url: String,
+    pub duration: u64,
+    pub desc: String,
+    pub state: i16,
+    pub state_desc: String,
+    pub dtime: u64,
+    pub ptime: u64,
+    pub ctime: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ArchivePage {
+    pub from_page: u32,
+    pub page_size: u32,
+    pub total: u64,
+    pub total_pages: u32,
+    pub fetched_pages: u32,
+    pub archives: Vec<Archive>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+struct RawArchivePageMetadata {
+    ps: u64,
+    count: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawArchiveAudit {
+    #[serde(rename = "Archive")]
+    archive: Archive,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawArchivePage {
+    page: RawArchivePageMetadata,
+    #[serde(default)]
+    arc_audits: Option<Vec<RawArchiveAudit>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PaginationPlan {
+    page_size: u32,
+    total: u64,
+    total_pages: u32,
+    fetched_pages: u32,
+    to_page: u32,
+}
+
+fn pagination_plan(
+    page_size: u64,
+    total: u64,
+    from_page: u32,
+    max_pages: Option<u32>,
+) -> Result<PaginationPlan> {
+    if from_page == 0 {
+        return Err(Kind::Custom("from_page must be at least 1".into()));
+    }
+    if max_pages == Some(0) {
+        return Err(Kind::Custom("max_pages must be at least 1".into()));
+    }
+    if page_size == 0 {
+        return Err(Kind::Custom("archive API returned a zero page size".into()));
+    }
+    let page_size = u32::try_from(page_size)
+        .map_err(|_| Kind::Custom("archive API page size is too large".into()))?;
+    let total_pages_u64 = total.div_ceil(u64::from(page_size));
+    let total_pages = u32::try_from(total_pages_u64)
+        .map_err(|_| Kind::Custom("archive API page count is too large".into()))?;
+
+    if total_pages == 0 {
+        if from_page != 1 {
+            return Err(Kind::Custom(
+                "from_page exceeds the empty archive result".into(),
+            ));
+        }
+        return Ok(PaginationPlan {
+            page_size,
+            total,
+            total_pages,
+            fetched_pages: 1,
+            to_page: 1,
+        });
+    }
+    if from_page > total_pages {
+        return Err(Kind::Custom(format!(
+            "from_page {from_page} exceeds total_pages {total_pages}"
+        )));
+    }
+
+    let remaining_pages = total_pages - from_page + 1;
+    let fetched_pages = max_pages
+        .map(|maximum| remaining_pages.min(maximum))
+        .unwrap_or(remaining_pages);
+    let to_page = from_page
+        .checked_add(fetched_pages - 1)
+        .ok_or_else(|| Kind::Custom("archive page range is too large".into()))?;
+    Ok(PaginationPlan {
+        page_size,
+        total,
+        total_pages,
+        fetched_pages,
+        to_page,
+    })
+}
+
+fn parse_archive_page(value: Value) -> Result<(RawArchivePageMetadata, Vec<Archive>)> {
+    let raw: RawArchivePage = serde_json::from_value(value)?;
+    let audits = match raw.arc_audits {
+        Some(audits) => audits,
+        None if raw.page.count == 0 => Vec::new(),
+        None => {
+            return Err(Kind::Custom(
+                "archive API omitted entries for a non-empty result".into(),
+            ));
+        }
+    };
+    Ok((
+        raw.page,
+        audits.into_iter().map(|audit| audit.archive).collect(),
+    ))
+}
+
+fn validate_archive_page_metadata(
+    expected: &RawArchivePageMetadata,
+    actual: &RawArchivePageMetadata,
+) -> Result<()> {
+    if actual.ps == 0 {
+        return Err(Kind::Custom("archive API returned a zero page size".into()));
+    }
+    if actual != expected {
+        return Err(Kind::Custom(
+            "archive API pagination metadata changed between pages".into(),
+        ));
+    }
+    Ok(())
+}
+
+impl Archive {
+    pub fn to_string_pretty(&self) -> String {
+        let status_string = match self.state {
+            0 => format!("\x1b[1;92m{}\x1b[0m", self.state_desc),
+            -2 => format!("\x1b[1;91m{}\x1b[0m", self.state_desc),
+            -30 => format!("\x1b[1;93m{}\x1b[0m", self.state_desc),
+            _ => self.desc.to_string(),
+        };
+        format!("{}\t{}\t{}", self.bvid, self.title, status_string)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+pub struct Subtitle {
+    open: i8,
+    lan: String,
+}
+
+#[derive(PartialEq, Deserialize, Serialize, Debug, Clone)]
+pub struct Credit {
+    #[serde(rename(deserialize = "type_id", serialize = "type"))]
+    pub type_id: i8,
+    pub raw_text: String,
+    pub biz_id: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Video {
+    pub title: Option<String>,
+    pub filename: String,
+    pub desc: String,
+    /// 已发布分P的 cid。
+    ///
+    /// 编辑稿件时 B 站要求已存在的分P回传自己的 cid，否则会把它们当作本次新增的
+    /// 分P，长稿件就会返回 21058「单次投稿添加的分P数已达最大上限」。
+    /// 新上传的分P没有 cid，序列化时省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cid: Option<u64>,
+}
+
+impl Video {
+    pub fn new(filename: &str) -> Video {
+        Video {
+            title: None,
+            filename: filename.into(),
+            desc: "".into(),
+            cid: None,
+        }
+    }
+
+    /// 截断标题到指定的最大字符数（默认80个字符，B站限制）
+    pub fn truncate_title(title: &str, max_chars: usize) -> String {
+        // 统计字符数（不是字节数）
+        let char_count = title.chars().count();
+        if char_count <= max_chars {
+            return title.to_string();
+        }
+
+        // 截断到max_chars-3个字符，然后添加"..."
+        let truncated: String = title.chars().take(max_chars - 3).collect();
+        format!("{}...", truncated)
+    }
+}
+
+#[cfg(test)]
+mod video_cid_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn editing_an_archive_keeps_existing_cids_and_omits_them_for_new_parts() {
+        // studio_data reads these entries from the archive view, then append
+        // extends this list before web/app edits serialize the same Studio.
+        let mut videos: Vec<Video> = serde_json::from_value(json!([
+            {"title": "existing part", "filename": "existing-key", "desc": "", "cid": 12345678901u64}
+        ])).unwrap();
+        videos.push(Video::new("new-key"));
+        let mut studio: Studio =
+            serde_json::from_value(json!({"tid": 171, "title": "existing archive"})).unwrap();
+        studio.videos = videos;
+        let wire = serde_json::to_value(&studio).unwrap();
+        assert_eq!(wire["videos"][0]["cid"], 12345678901u64);
+        assert_eq!(wire["videos"][0]["filename"], "existing-key");
+        assert!(wire["videos"][1].get("cid").is_none());
+        assert_eq!(wire["videos"][1]["filename"], "new-key");
+    }
+
+    #[test]
+    fn old_checkpoints_without_cid_and_null_cids_remain_readable() {
+        for payload in [
+            json!({"title": null, "filename": "key", "desc": ""}),
+            json!({"title": null, "filename": "key", "desc": "", "cid": null}),
+        ] {
+            let video: Video = serde_json::from_value(payload).unwrap();
+            assert!(video.cid.is_none());
+            assert!(serde_json::to_value(video).unwrap().get("cid").is_none());
+        }
+    }
+}
+
+#[derive(PartialEq, Eq, Debug, Clone)]
+pub enum Vid {
+    Aid(u64),
+    Bvid(String),
+}
+
+impl FromStr for Vid {
+    type Err = ParseIntError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let s = s.trim();
+        if s.len() < 3 {
+            return s.parse::<u64>().map(Vid::Aid);
+        }
+        // `get` 而不是 `&s[..2]`：第 2 字节落在多字节字符中间时切片会 panic
+        match s.get(..2) {
+            Some("BV") => Ok(Vid::Bvid(s.to_string())),
+            Some("av") => Ok(Vid::Aid(s[2..].parse()?)),
+            _ => Ok(Vid::Aid(s.parse()?)),
+        }
+    }
+}
+
+impl Display for Vid {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Vid::Aid(aid) => write!(f, "aid={}", aid),
+            Vid::Bvid(bvid) => write!(f, "bvid={}", bvid),
+        }
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct ReplyMember {
+    pub uname: String,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct ReplyContent {
+    pub message: String,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct Reply {
+    pub rpid: u64,
+    pub mid: u64,
+    pub member: ReplyMember,
+    pub content: ReplyContent,
+    pub ctime: u64,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+pub struct ReplyPage {
+    pub count: Option<u64>,
+    pub num: Option<u64>,
+    pub size: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+pub struct ReplyList {
+    #[serde(default)]
+    pub page: ReplyPage,
+    #[serde(default)]
+    pub replies: Option<Vec<Reply>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct BiliBili {
+    pub client: reqwest::Client,
+    pub login_info: LoginInfo,
+}
+
+impl BiliBili {
+    #[deprecated(note = "no longer working, fallback to `submit_by_app`")]
+    pub async fn submit(&self, studio: &Studio, proxy: Option<&str>) -> Result<ResponseData> {
+        warn!("客户端接口已失效, 将使用APP接口");
+        self.submit_by_app(studio, proxy).await
+    }
+
+    /// 使用必剪接口投稿
+    pub async fn submit_by_bcut_android(
+        &self,
+        studio: &Studio,
+        proxy: Option<&str>,
+    ) -> Result<ResponseData> {
+        let payload = {
+            let mut payload = json!({
+                "access_key": self.login_info.token_info.access_token,
+                "appkey": crate::credential::AppKeyStore::BCutAndroid.app_key(),
+                "aurora_version": "2.39.0",
+                "build": 2800030,
+                "c_locale": "zh-Hans_CN",
+                "channel": "master",
+                "mobi_app": "android_bbs",
+                "montage_version": "1.42.1.0",
+                "platform": "android",
+                "s_locale": "zh-Hans_CN",
+                "sdk_type": "mon",
+                "ts": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            });
+
+            let urlencoded = serde_urlencoded::to_string(&payload)?;
+            let sign = crate::credential::Credential::sign(
+                &urlencoded,
+                crate::credential::AppKeyStore::BCutAndroid.appsec(),
+            );
+            payload["sign"] = Value::from(sign);
+            payload
+        };
+
+        let ret: ResponseData = reqwest::Client::proxy_builder(proxy)
+            .user_agent("Mozilla/5.0 os/android model/Mi 10 Pro mobi_app/android_bbs build/2800030 channel/master osVer/13 kernel_version/V14.0.4.0.TJACNXM BiliDroid/5.6.0 (bbcallen@gmail.com)")
+            .timeout(Duration::new(60, 0))
+            .build()?
+            .post("https://member.bilibili.com/x/vu/mvp/add")
+            .query(&payload)
+            .json(studio)
+            .send()
+            .await?
+            .json()
+            .await?;
+        info!("{:?}", ret);
+        if ret.code == 0 {
+            info!("BCUT接口投稿成功");
+            Ok(ret)
+        } else {
+            Err(Kind::Custom(format!("{:?}", ret)))
+        }
+    }
+
+    pub async fn submit_by_app(
+        &self,
+        studio: &Studio,
+        proxy: Option<&str>,
+    ) -> Result<ResponseData> {
+        let payload = {
+            let mut payload = json!({
+                "access_key": self.login_info.token_info.access_token,
+                "appkey": crate::credential::AppKeyStore::BiliTV.app_key(),
+                "build": 7800300,
+                "c_locale": "zh-Hans_CN",
+                "channel": "bili",
+                "disable_rcmd": 0,
+                "mobi_app": "android",
+                "platform": "android",
+                "s_locale": "zh-Hans_CN",
+                "statistics": "\"appId\":1,\"platform\":3,\"version\":\"7.80.0\",\"abtest\":\"\"",
+                "ts": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            });
+
+            let urlencoded = serde_urlencoded::to_string(&payload)?;
+            let sign = crate::credential::Credential::sign(
+                &urlencoded,
+                crate::credential::AppKeyStore::BiliTV.appsec(),
+            );
+            payload["sign"] = Value::from(sign);
+            payload
+        };
+
+        let ret: ResponseData = reqwest::Client::proxy_builder(proxy)
+            .user_agent("Mozilla/5.0 BiliDroid/7.80.0 (bbcallen@gmail.com) os/android model/MI 6 mobi_app/android build/7800300 channel/bili innerVer/7800310 osVer/13 network/2")
+            .timeout(Duration::new(60, 0))
+            .build()?
+            .post("https://member.bilibili.com/x/vu/app/add")
+            .query(&payload)
+            .json(studio)
+            .send()
+            .await?
+            .json()
+            .await?;
+        info!("{:?}", ret);
+        if ret.code == 0 {
+            info!("APP接口投稿成功");
+            Ok(ret)
+        } else {
+            Err(Kind::Custom(format!("{:?}", ret)))
+        }
+    }
+
+    /// 通过 Web 接口投稿
+    pub async fn submit_by_web(
+        &self,
+        studio: &Studio,
+        proxy: Option<&str>,
+    ) -> Result<ResponseData> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let csrf = self.get_csrf()?;
+
+        let url_str = "https://member.bilibili.com/x/vu/web/add/v3";
+        let params = [("t", ts.to_string()), ("csrf", csrf.to_string())];
+        let url = reqwest::Url::parse_with_params(url_str, &params).unwrap();
+
+        let jar = self.web_cookie_jar(&url)?;
+
+        let ret: ResponseData = reqwest::Client::proxy_builder(proxy)
+            .user_agent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36")
+            .cookie_provider(std::sync::Arc::new(jar))
+            .timeout(Duration::new(60, 0))
+            .build()?
+            .post(url)
+            .json(studio)
+            .send()
+            .await?
+            .json()
+            .await?;
+        info!("{:?}", ret);
+
+        if ret.code == 0 {
+            info!("Web 接口投稿成功");
+            Ok(ret)
+        } else {
+            Err(Kind::Custom(format!("{:?}", ret)))
+        }
+    }
+
+    #[deprecated(note = "no longer working, fallback to `edit_by_app`")]
+    pub async fn edit(&self, studio: &Studio, proxy: Option<&str>) -> Result<serde_json::Value> {
+        warn!("客户端接口已失效, 将使用app接口");
+        self.edit_by_app(studio, proxy).await
+    }
+
+    pub async fn edit_by_web(&self, studio: &Studio) -> Result<serde_json::Value> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let ret: serde_json::Value = self
+            .client
+            .post(format!(
+                "https://member.bilibili.com/x/vu/web/edit?t={ts}&csrf={}",
+                self.get_csrf()?
+            ))
+            .json(studio)
+            .send()
+            .await?
+            .json()
+            .await?;
+        info!("{}", ret);
+        if ret["code"] == 0 {
+            info!("稿件修改成功");
+            Ok(ret)
+        } else {
+            Err(Kind::Custom(ret.to_string()))
+        }
+    }
+
+    pub async fn edit_by_app(
+        &self,
+        studio: &Studio,
+        proxy: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let payload = {
+            let mut payload = json!({
+                "access_key": self.login_info.token_info.access_token,
+                "appkey": crate::credential::AppKeyStore::BiliTV.app_key(),
+                "build": 7800300,
+                "c_locale": "zh-Hans_CN",
+                "channel": "bili",
+                "disable_rcmd": 0,
+                "mobi_app": "android",
+                "platform": "android",
+                "s_locale": "zh-Hans_CN",
+                "statistics": "\"appId\":1,\"platform\":3,\"version\":\"7.80.0\",\"abtest\":\"\"",
+                "ts": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            });
+
+            let urlencoded = serde_urlencoded::to_string(&payload)?;
+            let sign = crate::credential::Credential::sign(
+                &urlencoded,
+                crate::credential::AppKeyStore::BiliTV.appsec(),
+            );
+            payload["sign"] = Value::from(sign);
+            payload
+        };
+
+        let ret: Value = reqwest::Client::proxy_builder(proxy)
+            .user_agent("Mozilla/5.0 BiliDroid/7.80.0 (bbcallen@gmail.com) os/android model/MI 6 mobi_app/android build/7800300 channel/bili innerVer/7800310 osVer/13 network/2")
+            .timeout(Duration::new(60, 0))
+            .build()?
+            .post("https://member.bilibili.com/x/vu/app/edit/full")
+            .query(&payload)
+            .json(studio)
+            .send()
+            .await?
+            .json()
+            .await?;
+        info!("{:?}", ret);
+        if ret["code"] == 0 {
+            info!("稿件修改成功");
+            Ok(ret)
+        } else {
+            Err(Kind::Custom(ret.to_string()))
+        }
+    }
+
+    /// 查询视频的 json 信息
+    pub async fn video_data(&self, vid: &Vid, proxy: Option<&str>) -> Result<Value> {
+        let res: ResponseData = reqwest::Client::proxy_builder(proxy)
+            .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/63.0.3239.108")
+            .timeout(Duration::new(60, 0))
+            .build()?
+            .get(format!(
+                "https://member.bilibili.com/x/client/archive/view?access_key={}&{vid}",
+                self.login_info.token_info.access_token
+            ))
+            .send()
+            .await?
+            .json()
+            .await?;
+        match res {
+            res @ ResponseData {
+                code: _,
+                data: None,
+                ..
+            } => Err(Kind::Custom(format!("{res:?}"))),
+            ResponseData {
+                code: _,
+                data: Some(v),
+                ..
+            } => Ok(v),
+        }
+    }
+
+    pub async fn studio_data(&self, vid: &Vid, proxy: Option<&str>) -> Result<Studio> {
+        let mut video_info = self.video_data(vid, proxy).await?;
+        const EXTRA_FIELDS_BLACKLIST: &[&str] = &["limited_free"];
+
+        let mut archive_value = video_info["archive"].take();
+
+        if let Some(obj) = archive_value.as_object_mut() {
+            for key in EXTRA_FIELDS_BLACKLIST {
+                obj.remove(*key);
+            }
+        }
+
+        let mut studio: Studio = serde_json::from_value(archive_value)?;
+        let videos: Vec<Video> = serde_json::from_value(video_info["videos"].take())?;
+
+        studio.videos = videos;
+        Ok(studio)
+    }
+
+    pub async fn my_info(&self) -> Result<Value> {
+        Ok(self
+            .client
+            .get("https://api.bilibili.com/x/space/myinfo")
+            .send()
+            .await?
+            .json()
+            .await?)
+    }
+
+    async fn aid_from_vid(&self, vid: &Vid) -> Result<u64> {
+        match vid {
+            Vid::Aid(aid) => Ok(*aid),
+            Vid::Bvid(bvid) => {
+                let res: ResponseData = self
+                    .client
+                    .get("https://api.bilibili.com/x/web-interface/view")
+                    .query(&[("bvid", bvid)])
+                    .send()
+                    .await?
+                    .json()
+                    .await?;
+
+                match res {
+                    ResponseData {
+                        code: 0,
+                        data: Some(data),
+                        ..
+                    } => data["aid"].as_u64().ok_or("aid error".into()),
+                    res => Err(Kind::Custom(format!("{res:?}"))),
+                }
+            }
+        }
+    }
+
+    /// 获取视频评论列表
+    pub async fn comments(
+        &self,
+        vid: &Vid,
+        sort: u8,
+        pn: u32,
+        ps: u32,
+        _proxy: Option<&str>,
+    ) -> Result<ReplyList> {
+        let oid = self.aid_from_vid(vid).await?;
+        let res: ResponseData<ReplyList> = self
+            .client
+            .get("https://api.bilibili.com/x/v2/reply")
+            .query(&[
+                ("type", "1".to_string()),
+                ("oid", oid.to_string()),
+                ("sort", sort.to_string()),
+                ("pn", pn.to_string()),
+                ("ps", ps.to_string()),
+            ])
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        match res {
+            ResponseData {
+                code: 0,
+                data: Some(data),
+                ..
+            } => Ok(data),
+            res => Err(Kind::Custom(format!("{res:?}"))),
+        }
+    }
+
+    /// 回复视频评论
+    pub async fn reply_comment(
+        &self,
+        vid: &Vid,
+        rpid: u64,
+        message: &str,
+        _proxy: Option<&str>,
+    ) -> Result<Value> {
+        let oid = self.aid_from_vid(vid).await?;
+        let res: ResponseData = self
+            .client
+            .post("https://api.bilibili.com/x/v2/reply/add")
+            .form(&[
+                ("type", "1".to_string()),
+                ("oid", oid.to_string()),
+                ("root", rpid.to_string()),
+                ("parent", rpid.to_string()),
+                ("message", message.to_string()),
+                ("csrf", self.get_csrf()?.to_string()),
+            ])
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        match res {
+            ResponseData {
+                code: 0,
+                data: Some(data),
+                ..
+            } => Ok(data),
+            res => Err(Kind::Custom(format!("{res:?}"))),
+        }
+    }
+
+    pub async fn archive_pre(&self) -> Result<Value> {
+        Ok(self
+            .client
+            .get("https://member.bilibili.com/x/vupre/web/archive/pre")
+            .send()
+            .await?
+            .json()
+            .await?)
+    }
+
+    pub async fn recommend_tag(&self, subtype_id: u16, title: &str, key: &str) -> Result<Value> {
+        let result: ResponseData = self
+            .client
+            .get(format!("https://member.bilibili.com/x/vupre/web/tag/recommend?upload_id=&subtype_id={subtype_id}&title={title}&filename={key}&description=&cover_url=&t="))
+            .send()
+            .await?
+            .json()
+            .await?;
+        if result.code == 0 {
+            return Ok(result.data.unwrap_or_default());
+        }
+        Err(Kind::Custom(result.message))
+    }
+
+    pub(crate) fn get_csrf(&self) -> Result<&str> {
+        let csrf = self
+            .login_info
+            .cookie_info
+            .get("cookies")
+            .and_then(|c| c.as_array())
+            .ok_or("cookie error")?
+            .iter()
+            .filter_map(|c| c.as_object())
+            .find(|c| c["name"] == "bili_jct")
+            .ok_or("jct error")?
+            .get("value")
+            .and_then(|v| v.as_str())
+            .ok_or("csrf error")?;
+        Ok(csrf)
+    }
+
+    pub async fn cover_up(&self, input: &[u8]) -> Result<String> {
+        let response = self
+            .client
+            .post("https://member.bilibili.com/x/vu/web/cover/up")
+            .form(&json!({
+                "cover": format!("data:image/jpeg;base64,{}", base64::Engine::encode(&base64::engine::general_purpose::STANDARD, input)),
+                "csrf": self.get_csrf()?
+            }))
+            .send()
+            .await?;
+        let res: ResponseData = if !response.status().is_success() {
+            return Err(Kind::Custom(response.text().await?));
+        } else {
+            response.json().await?
+        };
+
+        if let ResponseData {
+            code: _,
+            data: Some(value),
+            ..
+        } = res
+        {
+            Ok(value["url"].as_str().ok_or("cover_up error")?.into())
+        } else {
+            Err(Kind::Custom(format!("{res:?}")))
+        }
+    }
+
+    /// 稿件管理
+    async fn archives(&self, status: &str, page_num: u32) -> Result<Value> {
+        // 复用登录时构建的客户端：cookie store 已含全部登录 Cookie，
+        // 且保留代理等配置，避免分页循环中每页新建 Client 和 cookie jar。
+        let res: ResponseData = self
+            .client
+            .get("https://member.bilibili.com/x/web/archives")
+            .query(&[("status", status), ("pn", &page_num.to_string())])
+            .timeout(Duration::new(60, 0))
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        match res {
+            ResponseData {
+                code: 0,
+                data: Some(v),
+                ..
+            } => Ok(v),
+            ResponseData { code, .. } => Err(Kind::Custom(format!(
+                "archive API returned Bilibili code {code}"
+            ))),
+        }
+    }
+
+    /// Fetch a bounded page range while preserving pagination metadata.
+    pub async fn recent_archives_page(
+        &self,
+        status: &str,
+        from_page: u32,
+        max_pages: Option<u32>,
+    ) -> Result<ArchivePage> {
+        // Validate request-only bounds before issuing a network request.
+        if from_page == 0 {
+            return Err(Kind::Custom("from_page must be at least 1".into()));
+        }
+        if max_pages == Some(0) {
+            return Err(Kind::Custom("max_pages must be at least 1".into()));
+        }
+
+        let first_page = self.archives(status, from_page).await?;
+        let (metadata, mut archives) = parse_archive_page(first_page)?;
+        let plan = pagination_plan(metadata.ps, metadata.count, from_page, max_pages)?;
+
+        let mut page_num = from_page;
+        while page_num < plan.to_page {
+            page_num = page_num
+                .checked_add(1)
+                .ok_or_else(|| Kind::Custom("archive page range is too large".into()))?;
+            let page = self.archives(status, page_num).await?;
+            let (page_metadata, mut page_archives) = parse_archive_page(page)?;
+            validate_archive_page_metadata(&metadata, &page_metadata)?;
+            archives.append(&mut page_archives);
+        }
+
+        Ok(ArchivePage {
+            from_page,
+            page_size: plan.page_size,
+            total: plan.total,
+            total_pages: plan.total_pages,
+            fetched_pages: plan.fetched_pages,
+            archives,
+        })
+    }
+
+    /// 获取所有稿件
+    #[deprecated(note = "use `recent_archives` instead")]
+    pub async fn all_archives(&self, status: &str) -> Result<Vec<Archive>> {
+        self.recent_archives(status, 1, None).await
+    }
+
+    /// 获取页数范围内的稿件
+    pub async fn recent_archives(
+        &self,
+        status: &str,
+        from_page: u32,
+        max_pages: Option<u32>,
+    ) -> Result<Vec<Archive>> {
+        Ok(self
+            .recent_archives_page(status, from_page, max_pages)
+            .await?
+            .archives)
+    }
+
+    /// Web 投稿请求用的 cookie jar。`Jar::add_cookie_str` 按单条 `Set-Cookie` 解析，
+    /// 把 `a=1; b=2` 整串传进去只会存下第一个 cookie（其余被当成属性丢掉），
+    /// 所以逐个加入。
+    fn web_cookie_jar(&self, url: &reqwest::Url) -> Result<reqwest::cookie::Jar> {
+        let jar = reqwest::cookie::Jar::default();
+        let cookies = self
+            .login_info
+            .cookie_info
+            .get("cookies")
+            .and_then(|c: &Value| c.as_array())
+            .ok_or("get cookie error")?;
+        for cookie in cookies {
+            if let (Some(name), Some(value)) = (cookie["name"].as_str(), cookie["value"].as_str()) {
+                jar.add_cookie_str(&format!("{name}={value}"), url);
+            }
+        }
+        Ok(jar)
+    }
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct ResponseData<T = Value> {
+    pub code: i32,
+    pub data: Option<T>,
+    message: String,
+    ttl: Option<u8>,
+}
+
+impl<T: Serialize> Display for ResponseData<T> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            serde_json::to_string(self).map_err(std::fmt::Error::custom)?
+        )
+    }
+}
+
+#[cfg(test)]
+mod archive_tests {
+    use super::{
+        RawArchivePageMetadata, pagination_plan, parse_archive_page, validate_archive_page_metadata,
+    };
+    use serde_json::json;
+
+    fn archive() -> serde_json::Value {
+        json!({
+            "aid": 1,
+            "bvid": "BV1test",
+            "title": "fixture",
+            "cover": "https://i0.hdslb.com/fixture.jpg",
+            "reject_reason": "",
+            "reject_reason_url": "",
+            "duration": 10,
+            "desc": "description",
+            "state": 0,
+            "state_desc": "已通过",
+            "dtime": 0,
+            "ptime": 1,
+            "ctime": 1
+        })
+    }
+
+    #[test]
+    fn pagination_rejects_zero_and_out_of_range_values() {
+        assert!(pagination_plan(10, 20, 0, Some(1)).is_err());
+        assert!(pagination_plan(10, 20, 1, Some(0)).is_err());
+        assert!(pagination_plan(0, 20, 1, Some(1)).is_err());
+        assert!(pagination_plan(10, 20, 3, Some(1)).is_err());
+        assert!(pagination_plan(10, 0, 2, Some(1)).is_err());
+    }
+
+    #[test]
+    fn pagination_is_bounded_without_unsigned_underflow() {
+        let plan = pagination_plan(10, 25, 2, Some(20)).unwrap();
+        assert_eq!(plan.page_size, 10);
+        assert_eq!(plan.total_pages, 3);
+        assert_eq!(plan.fetched_pages, 2);
+        assert_eq!(plan.to_page, 3);
+
+        let empty = pagination_plan(10, 0, 1, Some(1)).unwrap();
+        assert_eq!(empty.total_pages, 0);
+        assert_eq!(empty.fetched_pages, 1);
+        assert_eq!(empty.to_page, 1);
+
+        let maximum = pagination_plan(1, u64::from(u32::MAX), u32::MAX, Some(1)).unwrap();
+        assert_eq!(maximum.fetched_pages, 1);
+        assert_eq!(maximum.to_page, u32::MAX);
+    }
+
+    #[test]
+    fn archive_fixture_preserves_metadata_and_entries() {
+        let (metadata, archives) = parse_archive_page(json!({
+            "page": {"ps": 10, "count": 21},
+            "arc_audits": [{"Archive": archive()}]
+        }))
+        .unwrap();
+
+        assert_eq!(metadata.ps, 10);
+        assert_eq!(metadata.count, 21);
+        assert_eq!(archives.len(), 1);
+        assert_eq!(archives[0].bvid, "BV1test");
+    }
+
+    #[test]
+    fn malformed_archive_entries_are_reported_instead_of_silently_dropped() {
+        assert!(
+            parse_archive_page(json!({
+                "page": {"ps": 10, "count": 1},
+                "arc_audits": [{"unexpected": archive()}]
+            }))
+            .is_err()
+        );
+        assert!(
+            parse_archive_page(json!({
+                "page": {"ps": 10, "count": 1}
+            }))
+            .is_err()
+        );
+        assert!(
+            parse_archive_page(json!({
+                "page": {"ps": 10, "count": 0}
+            }))
+            .unwrap()
+            .1
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn followup_pages_must_keep_nonzero_consistent_metadata() {
+        let expected = RawArchivePageMetadata { ps: 10, count: 21 };
+        assert!(validate_archive_page_metadata(&expected, &expected).is_ok());
+        assert!(
+            validate_archive_page_metadata(&expected, &RawArchivePageMetadata { ps: 0, count: 21 })
+                .is_err()
+        );
+        assert!(
+            validate_archive_page_metadata(
+                &expected,
+                &RawArchivePageMetadata { ps: 20, count: 21 }
+            )
+            .is_err()
+        );
+        assert!(
+            validate_archive_page_metadata(
+                &expected,
+                &RawArchivePageMetadata { ps: 10, count: 22 }
+            )
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod vid_and_cookie_tests {
+    use super::{BiliBili, Vid};
+    use reqwest::cookie::CookieStore;
+    use serde_json::json;
+    use std::str::FromStr;
+
+    /// `Vid` 是 CLI 参数解析器；非 ASCII 输入必须报错，而不是在字节下标切片处 panic。
+    #[test]
+    fn vid_rejects_non_ascii_input_without_panicking() {
+        for input in ["中文", "a中", "B中V1", "BV", "av", ""] {
+            assert!(Vid::from_str(input).is_err(), "{input:?}");
+        }
+        assert_eq!(Vid::from_str(" av170001 "), Ok(Vid::Aid(170001)));
+        assert_eq!(
+            Vid::from_str("BV1ip4y1x7Gi"),
+            Ok(Vid::Bvid("BV1ip4y1x7Gi".into()))
+        );
+    }
+
+    /// Web 投稿用的 cookie jar 要带上登录信息里的全部 cookie，而不只是第一个。
+    #[test]
+    fn web_submit_cookie_jar_carries_every_login_cookie() {
+        let bili = BiliBili {
+            client: reqwest::Client::new(),
+            login_info: serde_json::from_value(json!({
+                "cookie_info": {"cookies": [
+                    {"name": "SESSDATA", "value": "sess%2C1*11"},
+                    {"name": "bili_jct", "value": "jct"},
+                    {"name": "DedeUserID", "value": "42"},
+                    {"name": "broken"}
+                ]},
+                "sso": [],
+                "token_info": {
+                    "access_token": "",
+                    "expires_in": 0,
+                    "mid": 42,
+                    "refresh_token": ""
+                },
+                "platform": null
+            }))
+            .unwrap(),
+        };
+        let url = reqwest::Url::parse("https://member.bilibili.com/x/vu/web/add/v3?t=1&csrf=jct")
+            .unwrap();
+
+        let jar = bili.web_cookie_jar(&url).unwrap();
+        let header = jar.cookies(&url).expect("jar holds no cookie for the URL");
+        let header = header.to_str().unwrap();
+        for expected in ["SESSDATA=sess%2C1*11", "bili_jct=jct", "DedeUserID=42"] {
+            assert!(header.contains(expected), "{expected} missing in {header}");
+        }
+        assert!(!header.contains("broken"), "{header}");
+    }
+}
+
+#[cfg(test)]
+mod studio_tid_v2_tests {
+    use super::Studio;
+
+    fn base_studio_json() -> serde_json::Value {
+        serde_json::json!({
+            "copyright": 1,
+            "source": "",
+            "tid": 95,
+            "cover": "",
+            "title": "t",
+            "desc": "",
+            "dynamic": "",
+            "tag": "",
+            "dolby": 0,
+            "lossless_music": 0,
+            "no_reprint": 0,
+            "charging_pay": 0,
+            "up_selection_reply": false,
+            "up_close_reply": false,
+            "up_close_danmu": false
+        })
+    }
+
+    #[test]
+    fn studio_json_omits_tid_v2_when_unset() {
+        let studio: Studio = serde_json::from_value(base_studio_json()).unwrap();
+        assert!(studio.tid_v2.is_none());
+        let value = serde_json::to_value(&studio).unwrap();
+        assert_eq!(value["tid"], 95);
+        assert!(
+            value.get("tid_v2").is_none(),
+            "unset tid_v2 must not appear in JSON: {value}"
+        );
+    }
+
+    #[test]
+    fn studio_json_includes_tid_v2_when_set() {
+        let mut raw = base_studio_json();
+        raw["tid_v2"] = serde_json::json!(2102);
+        let studio: Studio = serde_json::from_value(raw).unwrap();
+        assert_eq!(studio.tid_v2, Some(2102));
+        let value = serde_json::to_value(&studio).unwrap();
+        assert_eq!(value["tid"], 95);
+        assert_eq!(value["tid_v2"], 2102);
+    }
+
+    #[test]
+    fn studio_tid_v2_does_not_conflict_with_extra_fields() {
+        let mut raw = base_studio_json();
+        raw["tid_v2"] = serde_json::json!(2102);
+        raw["watermark"] = serde_json::json!({"state": 0});
+        let studio: Studio = serde_json::from_value(raw).unwrap();
+        assert_eq!(studio.tid_v2, Some(2102));
+        let value = serde_json::to_value(&studio).unwrap();
+        assert_eq!(value["tid_v2"], 2102);
+        assert_eq!(value["watermark"]["state"], 0);
+        assert_eq!(
+            studio
+                .extra_fields
+                .as_ref()
+                .unwrap()
+                .get("watermark")
+                .unwrap()["state"],
+            0
+        );
+
+        // Prefer first-class field when present; unrelated flatten keys still work.
+        let via_extra: Studio = serde_json::from_value(serde_json::json!({
+            "tid": 95,
+            "title": "t",
+            "watermark": {"state": 0}
+        }))
+        .unwrap();
+        assert!(via_extra.tid_v2.is_none());
+        assert_eq!(
+            via_extra
+                .extra_fields
+                .as_ref()
+                .unwrap()
+                .get("watermark")
+                .unwrap()["state"],
+            0
+        );
+    }
+}

@@ -1,0 +1,19 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "stream_gears.stream_gears"
+
+[project]
+name = "biliup"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "ForgQi" }]
+description = "Bilibili upload, login and direct stream download APIs"
+keywords = ["bilibili", "upload", "download"]
+urls = { Homepage = "https://github.com/biliup/biliup" }
+requires-python = ">=3.9"
+dependencies = []
+dynamic = ["version"]

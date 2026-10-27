@@ -1,10 +1,10 @@
 .idea
 .vscode
-.gitattributes
 *.pyc
 *.flv
 *.mp4
 *.part
+*.webm
 backup
 venv./
 .venv/
@@ -13,6 +13,7 @@ test/
 pdm.lock
 .pdm-python
 config.*.*
+config.yaml
 !public/config.yaml
 /configlog.ini
 ds_update.log*
@@ -23,7 +24,10 @@ ds_update.log*
 dist/
 build/
 cover/
-
+cache/
+.cursor/
+# Runtime clip exports in the working directory, not source modules.
+/clips/
 *.back
 bili.cookie.json
 archive.txt
@@ -34,8 +38,36 @@ biliup/**/public
 !package-lock.json
 qrcode.png
 *.log
-./*.ts
+*.tsbuildinfo
+/*.ts
 /biliup/stream-gears/
 data/
 .next
 out
+downloads/
+target
+_internal
+.trae/
+pnpm-lock.yaml
+cookies.json
+.augment/
+.cunzhi-memory/
+.serena/
+.cargo/*
+logs/
+.claude/
+/public/jassub/
+/tauri-app/src-tauri/render-tools/
+# 随包中文字体按固定 SHA-256 获取，见 crates/biliup-cli/assets/render-tools/README.txt
+/crates/biliup-cli/assets/render-tools/fonts/*.otf
+/crates/biliup-cli/assets/render-tools/fonts/*.ttf
+/renders/
+/crates/stream-gears/stream_gears/*.so
+/crates/stream-gears/stream_gears/*.pyd
+cilps/
+*.tmp
+.codex/
+
+# Local agent instructions (repository root only)
+/AGENTS.md
+/CLAUDE.md

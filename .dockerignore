@@ -1,0 +1,34 @@
+# 版本控制与 CI
+.git
+.github
+
+# 构建产物（镜像内会重新构建）
+target
+node_modules
+.next
+out
+dist
+tauri-app/node_modules
+tauri-app/src-tauri/target
+
+# 本地运行时数据与凭据，绝不能进入构建上下文
+data
+*.sqlite3
+*.sqlite3-*
+cookies.json
+*.flv
+*.mp4
+*.part
+*.unmasked
+*.xml
+*.log
+.env
+.env.*
+
+# 随包字体在镜像里按固定 SHA-256 取回，不进构建上下文
+crates/biliup-cli/assets/render-tools/fonts/*.otf
+crates/biliup-cli/assets/render-tools/fonts/*.ttf
+
+# 文档站与桌面端与镜像无关
+docs
+tauri-app

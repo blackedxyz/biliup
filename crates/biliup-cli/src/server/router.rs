@@ -1,0 +1,426 @@
+use crate::server::api::auto_clip::{
+    auto_clip_status, cancel_session_auto_clip, get_session_auto_clip, list_auto_clip_jobs,
+    start_session_auto_clip, test_auto_clip,
+};
+use crate::server::api::bilibili_endpoints::{
+    archive_pre_endpoint, get_user_archives_endpoint, get_user_profile_endpoint,
+};
+use crate::server::api::clip_publish::{
+    cover_route, get_session_thumb, list_publish_jobs, preview_publish, publish_batch,
+    publish_clip, remove_publish, resume_publish, retry_publish,
+};
+use crate::server::api::clip_suggestions::{
+    accept_suggestion, dismiss_suggestion, list_suggestions,
+};
+use crate::server::api::clips::{
+    create_clip, delete_clip, download_clip, export_clip, get_clip, list_clips, update_clip,
+};
+use crate::server::api::danmaku_density::get_danmaku_density;
+use crate::server::api::endpoints::{
+    add_upload_streamer_endpoint, add_user_endpoint, delete_streamers_endpoint,
+    delete_template_endpoint, delete_user_endpoint, get_configuration, get_qrcode, get_status,
+    get_streamer_info, get_streamer_info_files, get_streamers_endpoint, get_tools,
+    get_upload_streamer_endpoint, get_upload_streamers_endpoint, get_users_endpoint, get_videos,
+    login_by_qrcode, pause_streamers_endpoint, post_streamers_endpoint, post_uploads,
+    put_configuration, put_streamers_endpoint,
+};
+use crate::server::api::live_media::{get_live_avatar, get_live_cover};
+use crate::server::api::live_preview::{
+    get_live_danmaku, get_live_danmaku_multi, get_live_stream, get_live_url, release_live_stream,
+};
+use crate::server::api::live_rates::{get_live_rates, ws_live_rates};
+use crate::server::api::markers::{create_marker, delete_marker, list_markers, update_marker};
+use crate::server::api::renders::{
+    cancel_render, create_render, delete_render_asset, download_render, get_render,
+    get_render_asset, get_render_font, get_render_recipe, list_all_renders, list_renders,
+    preview_render, put_render_recipe, render_assets_route, render_gpus, render_tools,
+    retry_render,
+};
+use crate::server::api::session_retention::patch_session;
+use crate::server::api::sessions::{
+    delete_session, get_session, get_session_keyframes, get_session_media, list_sessions,
+};
+use crate::server::api::system_stats::get_system_stats;
+use crate::server::infrastructure::service_register::ServiceRegister;
+use axum::Router;
+use axum::body::Body;
+use axum::http::Request;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get, patch, post, put};
+use tower::ServiceExt;
+use tower_http::services::ServeFile;
+
+const ALLOWED_MEDIA_EXTENSIONS: &[&str] = &["mp4", "flv", "3gp", "webm", "mkv", "ts"];
+pub(crate) const ALLOWED_LOG_FILES: &[&str] = &["ds_update.log", "download.log", "upload.log"];
+/// 创建应用程序路由
+pub fn router(service_register: ServiceRegister) -> Router<()> {
+    Router::new()
+        .route(
+            "/v1/activity-events",
+            get(crate::server::api::activity_events::list),
+        )
+        .route(
+            "/v1/files/location",
+            get(crate::server::api::files::location),
+        )
+        .route("/v1/files/reveal", post(crate::server::api::files::reveal))
+        .route(
+            "/v1/upload-queue",
+            get(crate::server::api::upload_queue::list),
+        )
+        .route(
+            "/v1/upload-queue/{id}",
+            get(crate::server::api::upload_queue::detail),
+        )
+        .route(
+            "/v1/session-merge-candidates",
+            get(crate::server::api::session_groups::list_candidates),
+        )
+        .route(
+            "/v1/session-merge-candidates/{id}/confirm",
+            post(crate::server::api::session_groups::confirm_candidate),
+        )
+        .route(
+            "/v1/session-merge-candidates/{id}/dismiss",
+            post(crate::server::api::session_groups::dismiss_candidate),
+        )
+        .route(
+            "/v1/session-groups",
+            post(crate::server::api::session_groups::create_group),
+        )
+        // 主播管理相关路由
+        .route("/v1/streamers/page", get(crate::server::api::streamer_listing::page))
+        .route("/v1/overview", get(crate::server::api::streamer_listing::overview))
+        .route(
+            "/v1/streamers",
+            get(get_streamers_endpoint) // 获取主播列表
+                .post(post_streamers_endpoint) // 添加主播
+                .put(put_streamers_endpoint), // 更新主播
+        )
+        .route("/v1/streamers/{id}", delete(delete_streamers_endpoint)) // 删除主播
+        .route("/v1/streamers/{id}/pause", put(pause_streamers_endpoint))
+        // 正在录制的直播间封面 / 主播头像（服务端带 Referer 转发，避开图片 CDN 防盗链）
+        .route("/v1/streamers/{id}/cover", get(get_live_cover))
+        .route("/v1/streamers/{id}/avatar", get(get_live_avatar))
+        .route(
+            "/v1/streamers/{id}/mosaic-frame",
+            get(crate::server::api::mosaic_frame::get_mosaic_frame),
+        )
+        // 直播预览：复用正在录制的那一路流（chunked FLV / MPEG-TS），同样在登录校验之内
+        // DELETE / POST（sendBeacon）：播放器销毁时立即释放这条预览，见 live_preview::lease
+        .route(
+            "/v1/streamers/{id}/live",
+            get(get_live_stream)
+                .delete(release_live_stream)
+                .post(release_live_stream),
+        )
+        // 浏览器直连模式：当前录制中那条流的 CDN 直链
+        .route("/v1/streamers/{id}/live-url", get(get_live_url))
+        // 预览播放器的实时弹幕（SSE），同样在登录校验之内；监视器多路复用一条
+        .route("/v1/streamers/{id}/danmaku", get(get_live_danmaku))
+        .route("/v1/danmaku", get(get_live_danmaku_multi))
+        // 录制中各房间的写盘速率（只读内存）：WebSocket 每秒推一帧画码率曲线，HTTP 版供回退 / curl；
+        // 不要为此调快 /v1/streamers
+        .route("/v1/ws/live-rates", get(ws_live_rates))
+        .route("/v1/live-rates", get(get_live_rates))
+        // 切片工作台：场次、可落刀位置、DVR 回看（只按场次 id 寻址，不接受路径）
+        .route("/v1/sessions", get(list_sessions))
+        // PATCH 是「保留这场」：改场次的 retain_until；DELETE 清除已结束场次的历史记录。
+        .route(
+            "/v1/sessions/{id}",
+            get(get_session).patch(patch_session).delete(delete_session),
+        )
+        .route("/v1/sessions/{id}/keyframes", get(get_session_keyframes))
+        .route("/v1/sessions/{id}/media", get(get_session_media))
+        // 切片工作台：看直播时打的标记（只按场次 id、标记 id 寻址）
+        .route(
+            "/v1/sessions/{id}/markers",
+            get(list_markers).post(create_marker),
+        )
+        .route(
+            "/v1/sessions/{id}/markers/{mid}",
+            patch(update_marker).delete(delete_marker),
+        )
+        // 控制台首页的系统状态（CPU / 内存 / 录制目录磁盘 / 网速）；`?since=` 只取增量
+        .route("/v1/system-stats", get(get_system_stats))
+        // 切片工作台：切片与导出（只按场次 id、切片 id 寻址）
+        .route("/v1/sessions/{id}/clips", get(list_clips).post(create_clip))
+        .route(
+            "/v1/sessions/{id}/clips/{cid}",
+            patch(update_clip).delete(delete_clip),
+        )
+        .route("/v1/clips/{cid}", get(get_clip))
+        .route("/v1/clips/{cid}/export", post(export_clip))
+        .route("/v1/clips/{cid}/download", get(download_clip))
+        // 录后编辑与合成：保存场次配置、按 ID 上传图片、创建不可变合成任务。
+        .route(
+            "/v1/sessions/{id}/render-recipe",
+            get(get_render_recipe).put(put_render_recipe),
+        )
+        .route(
+            "/v1/sessions/{id}/render-settings",
+            get(get_render_recipe).put(put_render_recipe),
+        )
+        .route("/v1/sessions/{id}/render-assets", render_assets_route())
+        .route(
+            "/v1/render-assets/{aid}",
+            get(get_render_asset).delete(delete_render_asset),
+        )
+        .route(
+            "/v1/sessions/{id}/renders",
+            get(list_renders).post(create_render),
+        )
+        .route("/v1/renders", get(list_all_renders))
+        .route("/v1/render-gpus", get(render_gpus))
+        .route("/v1/renders/{jid}", get(get_render).delete(cancel_render))
+        .route("/v1/renders/{jid}/cancel", post(cancel_render))
+        .route("/v1/renders/{jid}/retry", post(retry_render))
+        .route("/v1/renders/{jid}/download", get(download_render))
+        .route("/v1/sessions/{id}/render-preview", post(preview_render))
+        .route("/v1/render-tools", get(render_tools))
+        .route("/v1/render-capabilities", get(render_tools))
+        .route("/v1/render-fonts/{id}", get(get_render_font))
+        // 切片工作台：发布（导出 → 上传 → 投稿；一律转载，来源默认直播间地址）
+        .route("/v1/clips/{cid}/publish", post(publish_clip))
+        .route("/v1/clips/{cid}/cover", cover_route())
+        .route("/v1/sessions/{id}/thumb", get(get_session_thumb))
+        .route(
+            "/v1/publish-jobs",
+            get(list_publish_jobs).post(publish_batch),
+        )
+        .route("/v1/publish-jobs/preview", post(preview_publish))
+        .route("/v1/publish-jobs/resume", post(resume_publish))
+        .route("/v1/publish-jobs/{jid}/retry", post(retry_publish))
+        .route("/v1/publish-jobs/{jid}", delete(remove_publish))
+        // 配置管理路由
+        .route(
+            "/v1/configuration",
+            get(get_configuration)
+                .put(put_configuration)
+                .layer(axum::middleware::from_fn(no_store)), // 含账号凭据，禁止 HTTP 缓存
+        )
+        // 自动切片（实验）：模型接口连通性测试与状态
+        .route("/v1/auto-clip/test", post(test_auto_clip))
+        .route("/v1/auto-clip/status", get(auto_clip_status))
+        // 多场各自最近的任务（剪辑台一页一次请求）
+        .route("/v1/auto-clip/jobs", get(list_auto_clip_jobs))
+        // 按场次生成候选：GET 看任务与用量预估，POST 先预估、确认后入队，DELETE 取消
+        .route(
+            "/v1/sessions/{id}/auto-clip",
+            get(get_session_auto_clip)
+                .post(start_session_auto_clip)
+                .delete(cancel_session_auto_clip),
+        )
+        // 候选：列表、接受（建切片草稿）、丢弃
+        .route("/v1/sessions/{id}/suggestions", get(list_suggestions))
+        .route(
+            "/v1/sessions/{id}/suggestions/{sid}/accept",
+            post(accept_suggestion),
+        )
+        .route(
+            "/v1/sessions/{id}/suggestions/{sid}/dismiss",
+            post(dismiss_suggestion),
+        )
+        // 弹幕密度曲线：10 秒一桶、基线与高峰
+        .route(
+            "/v1/sessions/{id}/danmaku-density",
+            get(get_danmaku_density),
+        )
+        // 主播信息路由
+        .route("/v1/streamer-info", get(get_streamer_info)) // 获取主播信息
+        .route("/v1/streamer-info/files/{id}", get(get_streamer_info_files)) // 获取主播信息
+        // 上传模板管理路由
+        .route("/v1/upload/streamers", get(get_upload_streamers_endpoint)) // 获取上传模板列表
+        .route(
+            "/v1/upload/streamers/{id}",
+            delete(delete_template_endpoint) // 删除上传模板
+                .get(get_upload_streamer_endpoint), // 获取单个上传模板
+        )
+        .route("/v1/upload/streamers", post(add_upload_streamer_endpoint)) // 添加上传模板
+        // 用户管理路由
+        .route("/v1/users", get(get_users_endpoint).post(add_user_endpoint)) // 获取用户列表/添加用户
+        .route(
+            "/v1/users/{id}",
+            get(get_user_profile_endpoint).delete(delete_user_endpoint),
+        )
+        .route("/v1/users/{id}/archives", get(get_user_archives_endpoint))
+        // B站API代理路由
+        .route("/bili/archive/pre", get(archive_pre_endpoint)) // 投稿预处理
+        // 认证相关路由
+        .route("/v1/get_qrcode", get(get_qrcode)) // 获取二维码
+        .route("/v1/login_by_qrcode", post(login_by_qrcode)) // 二维码登录
+        // 视频文件管理路由
+        .route("/v1/videos", get(get_videos)) // 获取视频列表
+        .route("/v1/status", get(get_status))
+        .route("/v1/tools", get(get_tools)) // ffmpeg 是否可用、版本与许可
+        .route("/v1/uploads", post(post_uploads))
+        .route("/static/{path}", get(using_serve_file_from_a_route))
+        // 斗鱼Cookie验证
+        .merge(crate::server::api::douyu_validation::router())
+        .with_state(service_register) // 注入服务注册器状态
+}
+
+async fn no_store(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+async fn using_serve_file_from_a_route(
+    axum::extract::Path(path): axum::extract::Path<String>,
+    request: Request<Body>,
+) -> Response {
+    let root = match std::env::current_dir() {
+        Ok(root) => root,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let path = match resolve_static_path(&root, &path) {
+        Ok(path) => path,
+        Err(StaticPathError::Invalid) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(StaticPathError::NotFound) => return StatusCode::NOT_FOUND.into_response(),
+    };
+
+    ServeFile::new(path).oneshot(request).await.into_response()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StaticPathError {
+    Invalid,
+    NotFound,
+}
+
+fn resolve_static_path(
+    root: &std::path::Path,
+    requested: &str,
+) -> Result<std::path::PathBuf, StaticPathError> {
+    use std::path::{Component, Path};
+
+    // The endpoint intentionally accepts an opaque basename, not a filesystem
+    // path.  Reject both separator styles so the same rule holds on every OS.
+    if requested.is_empty() || requested.contains('/') || requested.contains('\\') {
+        return Err(StaticPathError::Invalid);
+    }
+    let requested_path = Path::new(requested);
+    let mut components = requested_path.components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err(StaticPathError::Invalid);
+    }
+
+    if !ALLOWED_LOG_FILES.contains(&requested) {
+        return resolve_media_path(root, requested);
+    }
+
+    let root = root.canonicalize().map_err(|_| StaticPathError::NotFound)?;
+    let candidate = root.join(requested);
+    let canonical = candidate
+        .canonicalize()
+        .map_err(|_| StaticPathError::NotFound)?;
+    if !canonical.starts_with(&root) || !canonical.is_file() {
+        return Err(StaticPathError::Invalid);
+    }
+    Ok(canonical)
+}
+
+pub(crate) fn resolve_media_path(
+    root: &std::path::Path,
+    requested: &str,
+) -> Result<std::path::PathBuf, StaticPathError> {
+    use std::path::{Component, Path};
+
+    if requested.is_empty() || requested.contains('/') || requested.contains('\\') {
+        return Err(StaticPathError::Invalid);
+    }
+    let requested_path = Path::new(requested);
+    let mut components = requested_path.components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err(StaticPathError::Invalid);
+    }
+    let allowed = requested_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            ALLOWED_MEDIA_EXTENSIONS
+                .iter()
+                .any(|allowed| extension.eq_ignore_ascii_case(allowed))
+        });
+    if !allowed {
+        return Err(StaticPathError::Invalid);
+    }
+
+    let root = root.canonicalize().map_err(|_| StaticPathError::NotFound)?;
+    let canonical = root
+        .join(requested)
+        .canonicalize()
+        .map_err(|_| StaticPathError::NotFound)?;
+    if !canonical.starts_with(&root) || !canonical.is_file() {
+        return Err(StaticPathError::Invalid);
+    }
+    Ok(canonical)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StaticPathError, resolve_static_path};
+    use std::fs;
+
+    #[test]
+    fn static_files_are_limited_to_media_and_known_logs() {
+        let root = tempfile::tempdir().unwrap();
+        let video = root.path().join("recording.mp4");
+        let log = root.path().join("ds_update.log");
+        let cookie = root.path().join("cookies.json");
+        fs::write(&video, b"video").unwrap();
+        fs::write(&log, b"log").unwrap();
+        fs::write(&cookie, b"secret").unwrap();
+
+        assert_eq!(
+            resolve_static_path(root.path(), "recording.mp4").unwrap(),
+            video.canonicalize().unwrap()
+        );
+        assert_eq!(
+            resolve_static_path(root.path(), "ds_update.log").unwrap(),
+            log.canonicalize().unwrap()
+        );
+        assert_eq!(
+            resolve_static_path(root.path(), "cookies.json"),
+            Err(StaticPathError::Invalid)
+        );
+    }
+
+    #[test]
+    fn static_files_reject_absolute_and_traversal_paths() {
+        let root = tempfile::tempdir().unwrap();
+
+        for path in [
+            "../secret.mp4",
+            "/etc/passwd.mp4",
+            "nested/video.mp4",
+            "..\\secret.mp4",
+        ] {
+            assert_eq!(
+                resolve_static_path(root.path(), path),
+                Err(StaticPathError::Invalid)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn static_files_reject_symlinks_that_escape_the_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let link = root.path().join("escape.mp4");
+        symlink(outside.path(), &link).unwrap();
+
+        assert_eq!(
+            resolve_static_path(root.path(), "escape.mp4"),
+            Err(StaticPathError::Invalid)
+        );
+    }
+}

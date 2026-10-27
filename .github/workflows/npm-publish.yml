@@ -1,0 +1,66 @@
+name: npm
+
+on:
+  release:
+    types: [published]
+  # 补发某个已有 Release（如本工作流加入之前的 v1.2.9），或勾选 dry_run 只打包验证
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag，如 v1.2.9'
+        required: true
+      dry_run:
+        description: '只打包、冒烟测试并 npm publish --dry-run，不发布（不需要 NPM_TOKEN）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-publish-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish to npm
+    # 预发布不发 npm，与 release.yml / ci.yml 只认严格版本号 tag 一致
+    if: github.event_name == 'workflow_dispatch' || !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    # Release 建好时二进制还没构建完（release.yml 由 tag push 触发，v1.2.9 用了约 2 小时 20 分钟），prepare 最多等 300 分钟
+    timeout-minutes: 330
+    permissions:
+      contents: read
+      # trusted publishing（OIDC）与 npm publish --provenance
+      id-token: write
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # trusted publishing 需要 npm >= 11.5.1；Node 22 自带 npm 10，Node 24 自带 npm 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Prepare packages from release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node npm/scripts/prepare.mjs --tag "$TAG" --wait 300
+
+      - name: Smoke test (linux x64)
+        run: npm/scripts/smoke-test.sh npm/dist linux-x64-gnu
+
+      # 先发 7 个 @biliup/<平台> 子包，最后发根包 @biliup/cli；registry 上已有的版本跳过，失败后可直接重跑
+      # 优先使用 OIDC；NPM_TOKEN 仅作为可选回退，不要求预先配置 secret。
+      - name: Publish
+        if: env.DRY_RUN != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm/scripts/publish.sh npm/dist --provenance
+
+      - name: Publish (dry run)
+        if: env.DRY_RUN == 'true'
+        run: npm/scripts/publish.sh npm/dist --dry-run
